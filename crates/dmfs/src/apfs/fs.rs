@@ -290,7 +290,8 @@ impl Apfs {
     }
 
     /// 某对象的全部数据区段（按逻辑地址升序）。
-    pub fn extents_of(&self, id: u64) -> Result<Vec<record::Extent>> {
+    /// 按 inode id 扫 extent 记录。
+    fn extents_by(&self, id: u64) -> Result<Vec<record::Extent>> {
         let start = record::make_key_with(
             id,
             record::T_FILE_EXTENT,
@@ -311,6 +312,25 @@ impl Apfs {
                 true
             },
         )?;
+        Ok(out)
+    }
+
+    /// 文件的数据块记录。
+    ///
+    /// 键是**数据流 id**，不是 inode id：`j_inode_val_t.private_id` 才是
+    /// 存数据的那个流。普通文件两者相同，但被克隆（clonefile / Time Machine
+    /// 快照共享）、从 HFS+ 迁移来的文件会不同——只用 inode id 查，这类文件
+    /// 一个 extent 都找不到，症状正是「列表里有大小、导出却是 0 字节」。
+    /// Parallels 的 `CentOS Linux-0.hdd/*.hds` 就踩在这个坑上。
+    pub fn extents_of(&self, id: u64) -> Result<Vec<record::Extent>> {
+        let mut out = self.extents_by(id)?;
+        if out.is_empty() {
+            if let Some(ino) = self.inode(id)? {
+                if ino.private_id != 0 && ino.private_id != id {
+                    out = self.extents_by(ino.private_id)?;
+                }
+            }
+        }
         out.sort_by_key(|e| e.logical);
         Ok(out)
     }
@@ -444,7 +464,18 @@ impl FileSystem for Apfs {
         let ino = self.inode(id)?;
         let exts = self.extents_of(id)?;
         if exts.is_empty() {
-            // 空文件，或元数据已被回收：按 0 字节处理并让调用方用 size 判断
+            // 有 inode、有大小、却没有任何数据块记录 = 索引没了，不是空文件。
+            // 这里必须报错：以前一律 `Ok(0)`，导出端把 0 字节当成功，
+            // 于是一整批文件被写成空壳，用户还看到"0 个失败"。
+            let size = ino.as_ref().map(|i| i.size).unwrap_or(0);
+            if size > 0 {
+                return Err(Error::Unsupported(format!(
+                    "找不到数据块记录（size={size}, inode={id}, private_id={}）——\
+                     该文件的数据可能已被回收，或 extent 索引损坏",
+                    ino.as_ref().map(|i| i.private_id).unwrap_or(0)
+                )));
+            }
+            // 真的是 0 字节空文件
             return Ok(0);
         }
         let mut limit = ino.as_ref().map(|i| i.size).unwrap_or(0);

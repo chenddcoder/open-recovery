@@ -67,6 +67,23 @@ pub fn ui_log(msg: String) {
     }
 }
 
+/// 导出期间的诊断日志（写 `~/Library/Application Support/dmde-rs/export.log`）。
+///
+/// 只在失败时记：几万个文件全记会把盘写爆，而失败条目正是要查的对象。
+fn elog(msg: &str) {
+    let dir = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join("Library/Application Support/dmde-rs"))
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let _ = fs::create_dir_all(&dir);
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(dir.join("export.log")) {
+        let _ = writeln!(f, "[{}] {msg}", std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0));
+    }
+}
+
 /// 列出本机物理磁盘（`diskutil` 查询，不需要 root，也不会碰设备）。
 #[tauri::command]
 pub fn list_disks() -> Result<Vec<dmrpc::DiskDto>, String> {
@@ -267,7 +284,13 @@ fn single_export_result(st: &ExportStats, name: &str, dest: &Path) -> Result<Str
         return Ok(format!("{name} 已存在于输出目录，按当前策略跳过"));
     }
     if st.files == 0 {
-        return Err(format!("导出失败：{name}（读盘出错或目标不可写）"));
+        // 带上具体原因：是"读回 0 字节"还是"数据块记录找不到"，差别很大
+        let why = st
+            .fail_samples
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "读盘出错或目标不可写".into());
+        return Err(format!("导出失败：{name}（{why}）"));
     }
     Ok(format!("已导出 {} → {}（{}）", name, dest.display(), dmdisk::human_size(st.bytes)))
 }
@@ -535,6 +558,20 @@ pub struct ExportStats {
     pub bytes: u64,
     /// 用户主动暂停时为 true（此时的计数是「暂停前已完成的部分」）
     pub cancelled: bool,
+    /// 失败样本（最多 5 条，`名字: 原因`）。
+    ///
+    /// 只报"N 个失败"等于什么都没说——用户没法判断是盘坏了、路径太长、
+    /// 还是某个文件本身读不出来。带上几条具体名字，一眼能看出是不是同一类问题。
+    pub fail_samples: Vec<String>,
+}
+
+impl ExportStats {
+    /// 记一条失败样本，超过 5 条就不再收（汇总里也不列举了）。
+    fn note_failure(&mut self, msg: String) {
+        if self.fail_samples.len() < 5 {
+            self.fail_samples.push(msg);
+        }
+    }
 }
 
 /// 导出进度事件（每 ~120ms 最多一帧，避免刷屏拖慢导出本身）。
@@ -643,20 +680,43 @@ fn export_file(
     drop(w);
 
     match r {
-        Ok(n) => match fs::rename(&part, dest) {
-            Ok(()) => {
-                st.files += 1;
-                st.bytes += n;
-                on_progress(st, &entry.path);
+        Ok(n) => {
+            // 源明明有大小，却一个字节都没读出来 —— 绝不算成功。
+            // 以前这种 0 字节结果会被 rename 成正式文件名，之后 Skip 只看
+            // "文件存在"就再也不重试，等于把这个文件永久钉死成空壳。
+            if n == 0 && entry.size > 0 {
+                let _ = fs::remove_file(&part); // 空 .partial 没有保留价值
+                st.failed += 1;
+                st.note_failure(format!("{}: 读回 0 字节（源 {} 字节）", entry.name, entry.size));
+                elog(&format!(
+                    "READ0 {} size={} id={}",
+                    entry.path, entry.size, entry.id
+                ));
+                return;
             }
-            // 改名失败（目标被占用、跨卷等）算失败，但 .partial 里是完整数据，
-            // 留在原地比删掉强
-            Err(_) => st.failed += 1,
-        },
+            match fs::rename(&part, dest) {
+                Ok(()) => {
+                    st.files += 1;
+                    st.bytes += n;
+                    on_progress(st, &entry.path);
+                }
+                // 改名失败（目标被占用、跨卷等）算失败，但 .partial 里是完整数据，
+                // 留在原地比删掉强
+                Err(e) => {
+                    st.failed += 1;
+                    st.note_failure(format!("{}: 改名失败 {e}", entry.name));
+                    elog(&format!("RENAME {} -> {}: {e}", entry.path, dest.display()));
+                }
+            }
+        }
         // 被中断：文件本来就叫 .partial，不用改名，保留已恢复的字节
         Err(_) if cancel.load(Ordering::Relaxed) => st.cancelled = true,
         // 读盘失败：同样只留 .partial，正式名不会出现半个文件
-        Err(_) => st.failed += 1,
+        Err(e) => {
+            st.failed += 1;
+            st.note_failure(format!("{}: {e}", entry.name));
+            elog(&format!("FAIL {} size={}: {e}", entry.path, entry.size));
+        }
     }
 }
 
@@ -715,8 +775,10 @@ fn export_dir(
     st.dirs += 1;
     let entries = match b.list_dir(src, false) {
         Ok(v) => v,
-        Err(_) => {
+        Err(e) => {
             st.failed += 1;
+            st.note_failure(format!("{src}: 列目录失败 {e}"));
+            elog(&format!("LSFAIL {src}: {e}"));
             return;
         }
     };
@@ -787,6 +849,12 @@ fn export_summary(st: &ExportStats, dest: &Path) -> String {
     }
     if st.cancelled {
         extra.push_str("；已按你的要求暂停（未写完的文件改名为 .partial）");
+    }
+    if !st.fail_samples.is_empty() {
+        extra.push_str(&format!("；失败示例：{}", st.fail_samples.join("；")));
+        if st.failed as usize > st.fail_samples.len() {
+            extra.push_str(&format!("…等 {} 个（详见 export.log）", st.failed));
+        }
     }
     format!(
         "{} {}：{} 个文件、{} 个目录、{} 个失败{}，共 {}",
