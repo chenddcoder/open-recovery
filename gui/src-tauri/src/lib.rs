@@ -9,6 +9,7 @@
 
 pub mod commands;
 mod priv_helper;
+pub mod skip;
 
 use dmrpc::Backend;
 use std::sync::atomic::AtomicBool;
@@ -48,6 +49,7 @@ pub fn run() {
             commands::export_path,
             commands::cancel_export,
             commands::default_out_dir,
+            commands::default_skip_rules,
             commands::admin_state,
             commands::request_admin,
             commands::drop_admin,

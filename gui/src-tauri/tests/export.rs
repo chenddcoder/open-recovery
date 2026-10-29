@@ -76,6 +76,7 @@ fn export_stops_immediately_when_already_paused() {
         out.to_str().unwrap(),
         &cancel,
         dmde_gui_lib::commands::Conflict::Skip,
+        &dmde_gui_lib::skip::SkipRules::defaults(),
         &mut |_, _| {},
     )
     .expect("暂停不是错误，应返回 Ok");
@@ -108,6 +109,7 @@ fn export_works_again_after_pause() {
             out.to_str().unwrap(),
             &cancel,
             dmde_gui_lib::commands::Conflict::Skip,
+            &dmde_gui_lib::skip::SkipRules::defaults(),
             &mut |_, _| {},
         )
         .unwrap();
@@ -124,6 +126,7 @@ fn export_works_again_after_pause() {
             out.to_str().unwrap(),
             &cancel,
             dmde_gui_lib::commands::Conflict::Skip,
+            &dmde_gui_lib::skip::SkipRules::defaults(),
             &mut |_, _| {},
         )
         .unwrap();
@@ -152,6 +155,7 @@ fn prepare_existing(out: &std::path::Path) {
         out.to_str().unwrap(),
         &std::sync::atomic::AtomicBool::new(false),
         Conflict::Overwrite,
+        &dmde_gui_lib::skip::SkipRules::defaults(),
         &mut |_, _| {},
     )
     .expect("首次导出");
@@ -173,6 +177,7 @@ fn skip_keeps_existing_files() {
         out.to_str().unwrap(),
         &std::sync::atomic::AtomicBool::new(false),
         Conflict::Skip,
+        &dmde_gui_lib::skip::SkipRules::defaults(),
         &mut |_, _| {},
     )
     .unwrap();
@@ -202,6 +207,7 @@ fn rename_creates_numbered_copy_and_keeps_original() {
         out.to_str().unwrap(),
         &std::sync::atomic::AtomicBool::new(false),
         Conflict::Rename,
+        &dmde_gui_lib::skip::SkipRules::defaults(),
         &mut |_, _| {},
     )
     .unwrap();
@@ -233,6 +239,7 @@ fn overwrite_replaces_existing_content() {
         out.to_str().unwrap(),
         &std::sync::atomic::AtomicBool::new(false),
         Conflict::Overwrite,
+        &dmde_gui_lib::skip::SkipRules::defaults(),
         &mut |_, _| {},
     )
     .unwrap();
@@ -245,6 +252,50 @@ fn overwrite_replaces_existing_content() {
     assert!(
         !out.join("sub/deeper/n (1).txt").exists(),
         "覆盖不应产生副本"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 跳过规则必须在**读盘之前**生效：被跳过的目录连建都不建、内容一个字节都不读。
+///
+/// 这里用测试镜像里的 `/sub` 当"假 node_modules"：规则命中它，
+/// 导出根目录后 `sub` 应当整体消失，且汇总里明确报告跳过数量。
+#[test]
+fn export_skips_dirs_matching_rules() {
+    let Some(img) = image() else {
+        eprintln!("跳过：测试镜像不存在");
+        return;
+    };
+    let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+
+    // 目录名必须和已有的 skip 测试区分开：同一进程里测试是并行跑的，
+    // 用同一个临时目录会互相删掉对方的结果
+    let out = std::env::temp_dir().join(format!("dmde-skiprules-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+
+    let rules = dmde_gui_lib::skip::SkipRules::parse("sub");
+    let msg = dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Skip,
+        &rules,
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    assert!(
+        !out.join("root/sub").exists(),
+        "命中规则的目录不该出现在输出里：{}",
+        out.join("root/sub").display()
+    );
+    assert!(out.join("root/readme.txt").exists(), "没命中的条目要正常导出");
+    assert!(
+        msg.contains("按规则跳过"),
+        "汇总里要说清按规则跳过了多少，实际: {msg}"
     );
 
     let _ = std::fs::remove_dir_all(&out);

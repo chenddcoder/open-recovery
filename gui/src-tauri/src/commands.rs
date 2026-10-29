@@ -5,6 +5,7 @@
 //! * `Remote` —— `/dev/rdisk*`，经系统授权弹窗拉起的只读 helper 读。
 //! 前端不用关心是哪一种，命令签名完全一样。
 
+use crate::skip::SkipRules;
 use crate::{priv_helper, AppState};
 use dmrpc::{open_local, Backend, EntryDto, PreviewDto, RecoverDto, SourceDto};
 use dmfs::sanitize_name;
@@ -297,6 +298,15 @@ pub fn default_out_dir() -> String {
     format!("{home}/Downloads/dmde-rs-recovered")
 }
 
+/// 默认跳过规则串，给界面预填用。
+///
+/// 规则表放在 Rust 侧当权威来源：默认值只有一份，界面只是展示和编辑它，
+/// 免得前后端各写一份、改了一边忘了另一边。
+#[tauri::command]
+pub fn default_skip_rules() -> String {
+    crate::skip::DEFAULT_SPEC.to_string()
+}
+
 #[derive(serde::Serialize)]
 pub struct AdminState {
     /// 当前会话是否由特权 helper 提供
@@ -432,6 +442,8 @@ pub struct ExportStats {
     failed: u64,
     /// 因为目标已存在而跳过的条目数（策略为 Skip 时）
     skipped: u64,
+    /// 被跳过规则挡下的条目数（node_modules 之类），**不读盘**
+    skipped_rule: u64,
     bytes: u64,
     /// 用户主动暂停时为 true（此时的计数是「暂停前已完成的部分」）
     cancelled: bool,
@@ -444,6 +456,7 @@ pub struct ExportProgress {
     pub dirs: u64,
     pub failed: u64,
     pub skipped: u64,
+    pub skipped_rule: u64,
     pub bytes: u64,
     pub current: String,
     pub done: bool,
@@ -558,6 +571,7 @@ fn export_dir(
     depth: usize,
     cancel: &AtomicBool,
     conflict: Conflict,
+    rules: &SkipRules,
     on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) {
     // 防符号链接自指或异常深目录把栈打爆
@@ -618,9 +632,15 @@ fn export_dir(
             st.failed += 1;
             continue;
         }
+        // 规则命中就整棵跳过：连目录都不建、文件也不读。
+        // 这一步必须在 create_dir_all / read 之前——跳过的意义就是省掉读盘。
+        if rules.matches(&e.name, &e.path) {
+            st.skipped_rule += 1;
+            continue;
+        }
         let p = dest.join(&name);
         if e.is_dir {
-            export_dir(b, &e.path, &p, st, depth + 1, cancel, conflict, on_progress);
+            export_dir(b, &e.path, &p, st, depth + 1, cancel, conflict, rules, on_progress);
         } else {
             export_file(b, &e, &p, st, cancel, conflict, on_progress);
         }
@@ -648,8 +668,12 @@ pub async fn export_path(
     path: String,
     out_dir: String,
     on_conflict: Option<String>,
+    skip_rules: Option<String>,
 ) -> Result<String, String> {
     let conflict = Conflict::parse(on_conflict.as_deref());
+    // `skip_rules` 不传 = 用默认规则（跳过 node_modules 等）；
+    // 传空串 = 用户把列表清空了，表示「全都要」，一条也不跳。
+    let rules = SkipRules::from_opt(skip_rules.as_deref());
     // 把后端独占取出：既避免跨线程借用，也保证导出期间不会被别的命令插队
     let backend = {
         let mut g = state.backend.lock().map_err(|_| not_open())?;
@@ -665,7 +689,7 @@ pub async fn export_path(
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let mut b = backend;
         let mut last = std::time::Instant::now();
-        let res = do_export_with(&mut b, &path, &out_dir, &flag, conflict, &mut |st, cur| {
+        let res = do_export_with(&mut b, &path, &out_dir, &flag, conflict, &rules, &mut |st, cur| {
             // 节流：导出几万个小文件时，每个都发事件会把 WebView 拖死
             if last.elapsed().as_millis() >= 120 {
                 last = std::time::Instant::now();
@@ -677,6 +701,7 @@ pub async fn export_path(
                         dirs: st.dirs,
                         failed: st.failed,
                         skipped: st.skipped,
+                        skipped_rule: st.skipped_rule,
                         bytes: st.bytes,
                         current: cur.to_string(),
                         done: false,
@@ -721,6 +746,7 @@ pub fn do_export(b: &mut Backend, path: &str, out_dir: &str) -> Result<String, S
         out_dir,
         &AtomicBool::new(false),
         Conflict::default(),
+        &SkipRules::defaults(),
         &mut |_, _| {},
     )
 }
@@ -731,6 +757,7 @@ pub fn do_export_with(
     out_dir: &str,
     cancel: &AtomicBool,
     conflict: Conflict,
+    rules: &SkipRules,
     on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) -> Result<String, String> {
     let root = PathBuf::from(out_dir);
@@ -762,9 +789,13 @@ pub fn do_export_with(
                 st.failed += 1;
                 continue;
             }
+            if rules.matches(&e.name, &e.path) {
+                st.skipped_rule += 1;
+                continue;
+            }
             let p = dest.join(&n);
             if e.is_dir {
-                export_dir(b, &e.path, &p, &mut st, 1, cancel, conflict, on_progress);
+                export_dir(b, &e.path, &p, &mut st, 1, cancel, conflict, rules, on_progress);
             } else {
                 export_file(b, &e, &p, &mut st, cancel, conflict, on_progress);
             }
@@ -779,6 +810,9 @@ pub fn do_export_with(
     let mut extra = String::new();
     if st.skipped > 0 {
         extra.push_str(&format!("、跳过 {} 个（目标已存在）", st.skipped));
+    }
+    if st.skipped_rule > 0 {
+        extra.push_str(&format!("、按规则跳过 {} 个（依赖/缓存目录，未读盘）", st.skipped_rule));
     }
     if st.cancelled {
         extra.push_str("；已按你的要求暂停（未写完的文件改名为 .partial）");

@@ -329,6 +329,7 @@ async function ensureExportListener() {
     box.hidden = false;
     const parts = [`${p.files} 个文件`, `${p.dirs} 个目录`, fmtSize(p.bytes || 0)];
     if (p.skipped) parts.push(`跳过 ${p.skipped}`);
+    if (p.skipped_rule) parts.push(`按规则跳过 ${p.skipped_rule}`);
     if (p.failed) parts.push(`失败 ${p.failed}`);
     $("export-progress-text").textContent = `${parts.join(" · ")}\n${p.current || ""}`;
   });
@@ -362,6 +363,14 @@ $("btn-export").onclick = async () => {
   }
   const sel = $("sel-conflict");
   const onConflict = sel ? sel.value : "skip";
+  // 跳过规则：清空表示全都要恢复；规则本身按名字匹配，命中的目录整棵不读
+  const skipInput = $("input-skip");
+  const skipRules = skipInput ? skipInput.value.trim() : "";
+  if (skipInput) {
+    try {
+      localStorage.setItem("dmde.skipRules", skipRules);
+    } catch (_) {}
+  }
   const p = state.path || "/";
   setStatus(`正在导出 ${p} …`);
   const btn = $("btn-export");
@@ -378,7 +387,7 @@ $("btn-export").onclick = async () => {
   box.hidden = false;
   $("export-progress-text").textContent = "正在准备…";
   try {
-    const msg = await invoke("export_path", { path: p, outDir, onConflict });
+    const msg = await invoke("export_path", { path: p, outDir, onConflict, skipRules });
     // 后端会在消息里写明是"已暂停"还是"已导出"，直接透出
     setStatus(msg, msg.startsWith("已暂停") ? "" : "ok");
   } catch (e) {
@@ -420,6 +429,16 @@ $("btn-recover").onclick = recoverAll;
     $("input-out").value = state.outDir;
   } catch (_) {
     $("input-out").value = "./dmde-rs-recovered";
+  }
+  // 跳过规则：用户改过的优先，否则用后端给的默认值（node_modules 等）
+  try {
+    let saved = "";
+    try {
+      saved = localStorage.getItem("dmde.skipRules") || "";
+    } catch (_) {}
+    $("input-skip").value = saved || (await invoke("default_skip_rules")) || "node_modules, .git";
+  } catch (_) {
+    $("input-skip").value = "node_modules, .git";
   }
   await loadDisks();
   await updateAdmin();
