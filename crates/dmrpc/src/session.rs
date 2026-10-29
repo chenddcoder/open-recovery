@@ -156,7 +156,7 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
             size_human: human_size(p.size),
             offset: p.offset,
             fs_kind: kind.as_str().to_string(),
-            mountable: kind != FsKind::Unknown && kind != FsKind::Apfs,
+            mountable: kind != FsKind::Unknown,
         });
     }
 
@@ -175,10 +175,7 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
                 let cands: Vec<_> = table
                     .partitions
                     .iter()
-                    .filter(|p| {
-                        let k = dmfs::probe(&src.volume(p.offset, p.size));
-                        k != FsKind::Unknown && k != FsKind::Apfs
-                    })
+                    .filter(|p| dmfs::probe(&src.volume(p.offset, p.size)) != FsKind::Unknown)
                     .collect();
                 match cands.len() {
                     0 => {
@@ -205,7 +202,17 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
         }
     };
 
-    let fs = AnyFs::open(reader).map_err(OpenError::from)?;
+    // APFS 是容器套卷：真机上卷 0 常常是 Preboot/System，恢复要的却是 Data 卷。
+    // 这里自动挑「角色含 Data 的卷」，挑不到再退回 0，并把卷名写进描述。
+    let mut desc = desc;
+    let fs = if dmfs::probe(&reader) == FsKind::Apfs {
+        let idx = pick_apfs_volume(&reader);
+        let fs = AnyFs::open_volume(reader, idx).map_err(OpenError::from)?;
+        desc = format!("{desc} · 卷「{}」", fs.info().label);
+        fs
+    } else {
+        AnyFs::open(reader).map_err(OpenError::from)?
+    };
     let info = fs.info().clone();
     let dto = SourceDto {
         desc: desc.clone(),
@@ -223,6 +230,21 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
         details: info.details.clone(),
     };
     Ok((Session { source: source.to_string(), desc, fs, cache: HashMap::new() }, dto))
+}
+
+/// 选一个适合浏览/恢复的 APFS 卷：优先角色含 Data（0x2）的，否则第 0 个。
+fn pick_apfs_volume(reader: &dmdisk::Reader) -> usize {
+    const ROLE_DATA: u16 = 0x0002;
+    match dmfs::apfs::volumes(reader) {
+        Ok((_, vols)) => vols
+            .iter()
+            .find_map(|(i, v)| match v {
+                Ok(v) if v.role & ROLE_DATA != 0 => Some(*i),
+                _ => None,
+            })
+            .unwrap_or(0),
+        Err(_) => 0,
+    }
 }
 
 fn to_dto(base: &str, e: &Entry) -> EntryDto {
