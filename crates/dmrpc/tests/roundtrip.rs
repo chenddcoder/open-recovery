@@ -42,14 +42,25 @@ fn spawn_server(socket: &Path, token: &str) -> std::thread::JoinHandle<std::io::
 }
 
 /// 服务端是异步起来的，轮询到能连上为止。
+///
+/// 多个用例并行跑时，服务端线程排到 CPU 可能要一会儿；这里等 10 秒，
+/// 并把最后一次错误带进 panic 信息——否则只能看到"没起来"，查不出是
+/// socket 没建（bind 失败）还是 hello 握手失败。
 fn connect(socket: &Path, token: &str) -> Client {
-    for _ in 0..200 {
+    let mut last = String::new();
+    for _ in 0..400 {
         match Client::connect(socket, token) {
             Ok(c) => return c,
-            Err(_) => std::thread::sleep(Duration::from_millis(25)),
+            Err(e) => {
+                last = e.to_string();
+                std::thread::sleep(Duration::from_millis(25));
+            }
         }
     }
-    panic!("helper 在 5 秒内没起来: {}", socket.display());
+    panic!(
+        "helper 在 10 秒内没起来: {}（最后一次错误: {last}）",
+        socket.display()
+    );
 }
 
 #[test]
