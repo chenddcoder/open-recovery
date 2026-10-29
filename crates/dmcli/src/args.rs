@@ -16,6 +16,8 @@ pub struct Opts {
     pub dry_run: bool,
     pub verbose: bool,
     pub json: bool,
+    /// APFS 容器内的卷序号（0 起）
+    pub volume: usize,
     pub help: bool,
     pub version: bool,
 }
@@ -43,6 +45,7 @@ pub const HELP: &str = r#"dmde-rs —— 开源磁盘编辑器与数据恢复工
 
 通用参数:
   -p, --partition <N>   指定第 N 个分区（从 1 开始）
+      --volume <N>      APFS 容器内的卷序号（0 起；info 会列出每个卷）
       --offset <字节>   手动指定卷起始偏移
       --size <字节>     手动指定卷长度
   -v, --verbose         输出更多细节
@@ -92,6 +95,10 @@ pub fn parse(args: Vec<String>) -> Result<Opts, String> {
             }
             "-o" | "--out" => {
                 o.out = Some(it.next().ok_or("-o 缺少参数")?);
+            }
+            "--volume" => {
+                let v = it.next().ok_or("--volume 缺少参数")?;
+                o.volume = v.parse().map_err(|_| format!("卷序号非法: {v}"))?;
             }
             "--offset" => {
                 let v = it.next().ok_or("--offset 缺少参数")?;

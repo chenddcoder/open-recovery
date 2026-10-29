@@ -1,5 +1,6 @@
 //! 文件系统探测与统一分发。
 
+use crate::apfs::Apfs;
 use crate::exfat::ExFat;
 use crate::fat::{boot as fatboot, Fat};
 use crate::types::*;
@@ -67,6 +68,7 @@ pub enum AnyFs {
     Ntfs(crate::ntfs::Ntfs),
     Ext(crate::ext::Ext),
     HfsPlus(crate::hfsplus::HfsPlus),
+    Apfs(Apfs),
 }
 
 impl AnyFs {
@@ -80,14 +82,25 @@ impl AnyFs {
                 Ok(AnyFs::Ext(crate::ext::Ext::open(reader)?))
             }
             FsKind::HfsPlus => Ok(AnyFs::HfsPlus(crate::hfsplus::HfsPlus::open(reader)?)),
-            FsKind::Apfs => Err(Error::Unsupported(
-                "APFS 目前只做到容器识别：能认出这是 APFS 容器，但还不能列目录/读文件。\
-                 文件级解析（对象映射 B-tree、fs-tree、快照）正在实现中；\
-                 `dmde-rs volumes` 可以看到容器与卷的基本信息"
-                    .into(),
-            )),
+            FsKind::Apfs => Ok(AnyFs::Apfs(crate::apfs::open_volume(reader, 0)?)),
             FsKind::Unknown => Err(Error::Format("无法识别的文件系统".into())),
         }
+    }
+
+    /// 该文件系统专属的"删除后怎么救"说明（目前只有 APFS 有）。
+    pub fn recovery_hint(&self) -> Option<Vec<String>> {
+        match self {
+            AnyFs::Apfs(f) => Some(f.recovery_hint()),
+            _ => None,
+        }
+    }
+
+    /// 打开指定卷（只有 APFS 容器有多卷概念，其它文件系统忽略 `index`）。
+    pub fn open_volume(reader: Reader, index: usize) -> Result<Self> {
+        if probe(&reader) == FsKind::Apfs {
+            return Ok(AnyFs::Apfs(crate::apfs::open_volume(reader, index)?));
+        }
+        Self::open(reader)
     }
 
     /// 向下转型用：拿到具体实现的 `&dyn FileSystem`
@@ -98,6 +111,7 @@ impl AnyFs {
             AnyFs::Ntfs(f) => f,
             AnyFs::Ext(f) => f,
             AnyFs::HfsPlus(f) => f,
+            AnyFs::Apfs(f) => f,
         }
     }
 }

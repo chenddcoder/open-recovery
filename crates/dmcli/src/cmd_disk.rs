@@ -91,6 +91,7 @@ pub fn volumes(o: &Opts) -> Result<(), String> {
         "#", "类型", "起始偏移", "大小", "格式", "分区标识"
     );
     println!("{}", "-".repeat(96));
+    let mut has_apfs = false;
     for p in &table.partitions {
         let kind = probe(&src.volume(p.offset, p.size));
         println!(
@@ -108,6 +109,28 @@ pub fn volumes(o: &Opts) -> Result<(), String> {
             truncate(&p.type_name, 24),
             probe_detail(&kind)
         );
+        // APFS 是容器套卷，把内层卷也列出来，否则用户不知道 --volume 该给几
+        if kind == dmfs::FsKind::Apfs {
+            let reader = src.volume(p.offset, p.size);
+            if let Ok((c, vols)) = dmfs::apfs::volumes(&reader) {
+                has_apfs = true;
+                for (i, v) in vols {
+                    match v {
+                        Ok(v) => println!(
+                            "      └ 卷{i}  {:<24} {:>10}  {}",
+                            truncate(&v.name, 24),
+                            human_size(v.alloc_count.saturating_mul(c.bs as u64)),
+                            v.role_name()
+                        ),
+                        Err(e) => println!("      └ 卷{i}  解析失败: {e}"),
+                    }
+                }
+            }
+        }
+    }
+    if has_apfs {
+        println!();
+        println!("提示: APFS 是容器套卷，用 `--volume N` 选择内层卷（默认 0）");
     }
     Ok(())
 }
@@ -115,14 +138,14 @@ pub fn volumes(o: &Opts) -> Result<(), String> {
 fn probe_detail(k: &dmfs::FsKind) -> String {
     match k {
         dmfs::FsKind::Unknown => "（无法识别）".into(),
-        dmfs::FsKind::Apfs => "（暂不支持）".into(),
+        dmfs::FsKind::Apfs => "可挂载为 APFS".into(),
         other => format!("可挂载为 {}", other.as_str()),
     }
 }
 
 pub fn info(o: &Opts) -> Result<(), String> {
     let source = o.positional.first().ok_or("info 需要指定源")?;
-    let opened = open_fs(source, o.partition, o.offset, o.size)?;
+    let opened = open_fs(source, o.partition, o.offset, o.size, o.volume)?;
     println!("源      : {}", opened.desc);
     if let Some(p) = &opened.partition {
         println!("分区    : #{:<2} {:<26} {}", p.index, p.type_name, human_size(p.size));

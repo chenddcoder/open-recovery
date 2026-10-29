@@ -10,19 +10,32 @@ use std::path::Path;
 
 pub fn recover(o: &Opts) -> Result<(), String> {
     let source = o.positional.first().ok_or("recover 需要指定源")?;
-    let opened = open_fs(source, o.partition, o.offset, o.size)?;
+    let opened = open_fs(source, o.partition, o.offset, o.size, o.volume)?;
     let fs = &opened.fs;
 
     println!("源      : {}", opened.desc);
     println!("文件系统: {}", fs.info().kind.as_str());
-    if !fs.supports_deleted() {
+
+    let hint = opened.fs.recovery_hint();
+    if let Some(lines) = &hint {
         println!();
-        println!(
-            "{} 删除时会直接销毁目录记录，无法按目录项恢复。",
-            fs.info().kind.as_str()
-        );
-        println!("这类卷需要「签名雕刻」(carving) 才能找回文件——该模块规划在 v0.2。");
-        return Ok(());
+        for l in lines {
+            println!("{l}");
+        }
+    }
+    if !fs.supports_deleted() {
+        if hint.is_none() {
+            println!();
+            println!(
+                "{} 删除时会直接销毁目录记录，无法按目录项恢复。",
+                fs.info().kind.as_str()
+            );
+            println!("这类卷需要「签名雕刻」(carving) 才能找回文件——该模块规划在 v0.2。");
+            return Ok(());
+        }
+        // APFS：虽然没有目录项可救，仍扫一遍孤儿 inode（有就是赚到）
+        println!();
+        println!("再扫一遍孤儿 inode（全树扫描，卷越大越慢）…");
     }
 
     print!("正在扫描可恢复项 ... ");
@@ -35,7 +48,14 @@ pub fn recover(o: &Opts) -> Result<(), String> {
         items.truncate(o.limit);
     }
     if items.is_empty() {
-        println!("没有符合条件的已删除文件。");
+        if hint.is_some() {
+            println!(
+                "没有孤儿 inode——APFS 上这属于正常：删除会把 drec 与 inode 一起回收。\n\
+                 真正还能救的是快照和 .Trashes，见上面 ①②。"
+            );
+        } else {
+            println!("没有符合条件的已删除文件。");
+        }
         return Ok(());
     }
 
@@ -91,8 +111,10 @@ pub fn recover(o: &Opts) -> Result<(), String> {
         failed,
         fmt::size_str(bytes)
     );
-    println!("注意：FAT/exFAT 的簇链在删除时已被清空，恢复按「连续簇」推断；");
-    println!("      若文件原本碎片化，请改用签名雕刻方案。");
+    if fs.info().kind.is_fat() || fs.info().kind == dmfs::FsKind::ExFat {
+        println!("注意：FAT/exFAT 的簇链在删除时已被清空，恢复按「连续簇」推断；");
+        println!("      若文件原本碎片化，请改用签名雕刻方案。");
+    }
     Ok(())
 }
 

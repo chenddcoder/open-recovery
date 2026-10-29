@@ -24,8 +24,9 @@ Rust 核心**零第三方依赖**，命令行与图形界面共用同一套引�
 | NTFS | ✅ 已验证 | 引导扇区、MFT、属性、runlist、`$INDEX_ROOT`、删除记录恢复 |
 | ext2/3/4 | ✅ 已验证 | 超级块、块组、inode、extent 树 + 间接块 |
 | HFS+ / HFSX | ✅ 已验证 | 卷头、catalog B-tree、fork extents |
-| APFS | 🚧 仅容器识别 | 能认出 APFS 容器；卷/目录/文件解析见下节路线 |
-| 签名雕刻（carving） | ⏳ 规划 | HFS+/APFS 删除后只能靠它 |
+| APFS | ✅ 已验证 | 容器/检查点/对象映射/fs-tree；多卷（`--volume`）、两种 drec 键格式 |
+| APFS 删除恢复 | 🚧 部分 | `.Trashes` + 孤儿 inode；快照 diff 与雕刻待做 |
+| 签名雕刻（carving） | ⏳ 规划 | HFS+/APFS 深删后只能靠它 |
 | GUI | ✅ Tauri v2 | 磁盘→分区→目录→预览→导出/恢复 |
 | 提权读取设备 | ✅ macOS | 系统授权窗 → 只读 helper，GUI 本体不以 root 运行 |
 
@@ -58,42 +59,61 @@ GUI (你的身份)  ── Unix socket + token ──▶  dmde-rs-helper (root, 
 
 ---
 
-## APFS：现状与路线（重点）
+## APFS：已经能读，恢复靠快照（重点）
 
-**现状：只做到"认得出"。** 打开 APFS 卷会明确告诉你还不能列目录，而不是假装挂载成功。
-这不是疏忽，是分层没做完：APFS 不是"超级块 + 目录项"的结构，而是一套**对象化、带事务的 B-tree 系统**。
+**现状：容器 → 卷 → 目录 → 文件全链路打通**，`ls / tree / cat / extract` 与 FAT/NTFS 同一套命令。
+这是本轮的主要工作量：APFS 不是「超级块 + 目录项」，而是**对象化、写时复制、多层 B-tree** 的系统。
 
-已经用真实 APFS 镜像（`hdiutil create -fs APFS`）确认的落盘布局（macOS 26 生成的卷）：
+### 实测出来的落盘布局（macOS 26）
 
 | 结构 | 位置 / 要点 |
 |---|---|
-| `NXSB` 容器超级块 | 容器第 0 块；`magic@0x20`、`block_size@0x24`、`block_count@0x28`、`omap_oid@0xa0`、`fs_oid[]@0xb8` |
-| 检查点 | `nx_xp_desc_base/desc_blocks` 指向连续的 NXSB 副本（每 2 块一份） |
-| `omap_phys` | `nx_omap_oid` 是**物理** oid（就是块号）；`om_tree_oid@0x30` 指向 omap B-tree |
+| `NXSB` 容器超级块 | 块 0；`magic@0x20`、`block_size@0x24`、`block_count@0x28`、`omap_oid@0xa0`、`fs_oid[]@0xb8`、检查点描述区 `desc_base@0x70` / `desc_blocks@0x68` |
+| 检查点 | 每写一次事务新增一份 NXSB 副本；**必须取 xid 最大且校验通过的那份**，否则读到旧树 |
+| `omap_phys` | `omap_oid` 是**物理** oid（就是块号）；`om_tree_oid@0x30` |
 | `btree_node_phys` | 头 0x38；`flags@0x20`（ROOT/LEAF/FIXED_KV）、`level@0x22`、`nkeys@0x24`、`table_space@0x28` |
-| TOC / 键 / 值 | TOC 条目 `{u16 k; u16 v}`；键区起点 = `0x38 + table_space.off + table_space.len`；值从块尾向前放 |
-| `APSB` 卷超级块 | `magic@0x20`、`features@0x28`、`alloc_count@0x58`、`meta_crypto@0x60`（`cpflags&1`=加密）、`omap_oid@0x80`、`root_tree_oid@0x88`、`snap_meta_tree_oid@0x98`、卷名 `@0x2c0`（256 字节） |
+| `APSB` 卷超级块 | `omap_oid@0x80`、`root_tree_oid@0x88`、`snap_meta_tree_oid@0x98`、`num_files@0xb8`、`num_snapshots@0xd8`、`fs_flags@0x108`（bit0=未加密）、卷名 `@0x2c0` |
 
-在 256 MB 测试卷上实测：容器 4096 B/块、65526 块；`fs_oid=[1026]`；container omap 在第 405 块 →
-tree 在 406 块；**omap 里 `(1026, xid=6) → paddr=404`，第 404 块正是 `APSB`（oid 1026, xid 6）**；
-卷 omap 在 399 块，`(1028, 5) → 392`，第 392 块的对象头 `oid=1028`——即卷的 fs-tree 根。
-也就是说对象映射这条链路已经跑通，剩下的是 fs-tree 的记录解析。
+### 三个把解析卡住、最后靠实测钉死的细节
 
-**接下来分三步（按依赖顺序）：**
+1. **值区偏移**：TOC 里的 `v` 是「从值区末尾往回数」的偏移，
+   值起点 = `块尾 − (root ? 40 : 0) − v`。root 节点末尾有 40 字节 `btree_info_t`，
+   不减掉它，所有记录都会整体错位 40 字节——表现得像「记录解析全错」。
+2. **Fletcher64 是变体**：`hi = s2`、`lo = 0xFFFFFFFF − (s1+s2) mod`，等价于
+   「整块（含 cksum 字段）的 s1 ≡ 0 (mod 2³²−1)」。按教科书 Fletcher 写会「高 32 位对、低 32 位错」。
+3. **目录项名字有两种键格式**：`j_drec_hashed_key_t`（`u32 name_len_and_hash`，**低 10 位**才是名字长度，
+   名字从 12 字节开始）与 `j_drec_key_t`（`u16 name_len`，名字从 10 字节开始）。
+   触发条件是「大小写不敏感 **或** 规范化不敏感」，两者不等价：
+   `newfs_apfs -e` 造的卷是「大小写敏感 + 规范化不敏感 + hashed 键」。
+   代码不靠标志硬猜，而是用「名字长度必须等于键剩余长度」自校验，两种格式都能吃。
 
-1. **B-tree 通用层 + 对象映射**：`kvoff` 值偏移规则、Fletcher64 校验、多级节点下降；
-   `oid → paddr`（按 xid 取最新可见版本）。产出：能定位任意卷的 fs-tree 根。
-2. **fs-tree 记录解析**：`j_key`（`obj_id | type`）、`j_drec_key/val`（目录项 + xfields）、
-   `j_inode_val`（大小、时间）、`j_file_extent_val`（逻辑地址 → 物理块，读文件内容）。
-   产出：APFS 卷可以像 FAT/NTFS 一样 `ls / cat / extract`。
-3. **恢复**：APFS 删除会直接抹掉目录记录，按目录项恢复通常没戏——真正的抓手是
-   ① **快照**（`snap_meta_tree`，本地 Time Machine 快照里保留旧 fs-tree，按 xid 读旧版本再 diff）；
-   ② **extent 残留扫描**（已释放但未覆盖的块，按 inode/extent 特征重建）；
-   ③ 最后兜底才是签名雕刻。这三条都要在第 2 步之上做。
+另外 inode 值里 xfields 的起点实测是 **92**（apfs.h 写 86，多 6 字节填充），同样按内容自校验定位。
 
-**FileVault 加密卷**是另一条独立战线：`meta_crypto.cpflags&1` 为真时，fs-tree 的键值是加密的，
-必须先拿到卷密钥（keybag + AES-XTS 解包）。本版对此只做识别与提示，不做解密；
-实务上可以先在系统里解锁卷再处理其**未加密的容器元数据**，或对硬件加密盘做镜像后离线分析。
+### 删除恢复：APFS 上能救的与救不了的
+
+| 途径 | 有效性 | 说明 |
+|---|---|---|
+| `/.Trashes/<uid>/` | ✅ 最实用 | macOS 删除只是移动过去；清空废纸篓前文件完整。`ls /.Trashes/501` 直接导出即可 |
+| 本地快照 | ✅ 最强，**本版未做** | 快照里保留旧 fs-tree，按旧 xid 读出再与当前树 diff。下一版目标 |
+| 孤儿 inode 扫描 | ⚠️ 少见 | `recover` 会做；真删后通常连 inode 一起回收，扫不到属正常 |
+| 签名雕刻 | ⏳ 规划 | 兜底手段，不依赖目录结构 |
+
+`recover` 在 APFS 上会先打印上面几条路径，再跑一次孤儿扫描（全树遍历，卷越大越慢）。
+
+### 已验证范围（真镜像，不是「应该能跑」）
+
+- `hdiutil create -fs APFS`：大小写不敏感卷，2 级目录、中文名、符号链接、硬链接、5 MB 多 extent 文件
+  → `cat` 内容 md5 与原文件**逐字节一致**，全量 `extract` 206 个文件 0 失败
+- `newfs_apfs -e`：大小写敏感卷，`ABC.txt` 与 `abc.txt` 共存且都能列出、读到正确内容
+- 合成容器测试（`crates/dmfs/tests/apfs_synthetic.rs`）：64 块最小容器、**两个卷**（验证 `--volume`）、
+  两种 drec 键格式、Fletcher 校验、坏块检测，6 项断言全过
+
+### 限制
+
+- **FileVault 加密卷**：`fs_flags` 未置「未加密」时直接报错并说明，不做解密（需要 keybag + AES-XTS）。
+- **decmpfs 透明压缩文件**：读会明确报错并提示用 `ditto` / `afsctool -d` 解压，不会吐出压缩流冒充原文件。
+- **sealed 系统卷**：只读访问没问题，但不校验哈希树。
+- **快照**：只显示数量，尚未按快照读旧树。
 
 ---
 
@@ -271,13 +291,19 @@ gui/              Tauri v2（Rust 后端直调 dmdisk/dmfs，前端纯 HTML/JS�
 ## 测试
 
 ```bash
-cargo test          # 单元测试 + NTFS 合成镜像端到端测试
+cargo test          # 单元测试 + NTFS/FAT/APFS 合成镜像端到端测试
 ```
 
-NTFS 没有可用的 mkntfs，所以测试里**按规范逐字节构造**了一个最小 NTFS 卷
-（`crates/dmfs/tests/ntfs_synthetic.rs`）：引导扇区、MFT、`$FILE_NAME`、`$INDEX_ROOT`、
-常驻/非常驻 `$DATA`、已删除记录、fixup 全部手写。这样每个偏移都被真实字节校验过，
-也能长期当回归测试用。
+NTFS 没有可用的 mkntfs，APFS 更没法用 `hdiutil` 造出「多卷 + 大小写敏感 + 指定 xid」
+这类组合，所以这两者都在测试里**按规范逐字节构造**最小卷：
+
+- `crates/dmfs/tests/ntfs_synthetic.rs`：引导扇区、MFT、`$FILE_NAME`、`$INDEX_ROOT`、
+  常驻/非常驻 `$DATA`、已删除记录、fixup；
+- `crates/dmfs/tests/apfs_synthetic.rs`：64 块容器、NXSB + 检查点、容器/卷两张 omap、
+  两个卷（不同 drec 键格式）、fs-tree 的 drec/inode/extent、Fletcher64 自校验与坏块检测；
+- `crates/dmfs/tests/fat_synthetic.rs`：FAT 目录项与 LFN。
+
+这样每个偏移都被真实字节校验过，也能长期当回归测试用（改解析代码时立刻能发现偏移写错）。
 
 真实镜像验证脚本（需要 macOS 的 `hdiutil`、`newfs_msdos`、`newfs_hfs`）：
 
@@ -291,14 +317,18 @@ NTFS 没有可用的 mkntfs，所以测试里**按规范逐字节构造**了一�
 - FAT16：删除的 27 字节长文件名文件被完整恢复，内容与原文一致；
 - exFAT：删除的 `gone.txt` 名字、大小、内容全部还原；
 - ext4（`mke2fs -d` 生成）：目录树遍历 + 文件导出后 `cmp` 与原文件字节一致；
-- HFS+：catalog 解析、目录树、文件读取正常（删除恢复按设计返回空并说明原因）。
+- HFS+：catalog 解析、目录树、文件读取正常（删除恢复按设计返回空并说明原因）；
+- APFS（`hdiutil create -fs APFS`）：5 MB 多 extent 文件 `cat` 后 md5 与源文件一致，
+  全量导出 206 个文件 0 失败；中文名、符号链接、硬链接、`.Trashes` 均正确；
+- APFS（`newfs_apfs -e`）：大小写敏感卷，`ABC.txt`/`abc.txt` 共存且各自内容正确。
 
 ---
 
 ## 已知限制
 
 1. **只读**：没有扇区编辑/写回，也不打算在 v0.1 提供（写盘要配套"写前二次确认 + 备份"）。
-2. **APFS 未解析**：macOS 系统盘目前只能看分区表。
+2. **APFS 恢复能力有限**：能完整浏览/导出存活文件，但清空废纸篓后的文件只能靠快照；
+   加密卷、decmpfs 压缩文件不支持。
 3. **RAID / LVM / LDM** 未实现，动态盘、软 RAID 需要用镜像重组。
 4. ext4 的 `meta_bg`、超大卷的块组定位可能不准；NTFS 的 `$ATTRIBUTE_LIST` 未展开。
 5. HFS+ 的 extents overflow 文件未解析，单文件超过 8 个 extent 时会提示"extents 溢出"。
@@ -310,7 +340,9 @@ NTFS 没有可用的 mkntfs，所以测试里**按规范逐字节构造**了一�
 - [ ] 签名雕刻（规则文件 + 头尾匹配 + 碎片拼接）
 - [ ] 镜像/克隆（坏道跳过与重试、速度曲线）
 - [ ] GPT 备份表恢复、丢失分区扫描重建
-- [ ] APFS 容器与卷（含加密卷口令）
+- [x] APFS 容器、多卷、fs-tree 浏览与导出
+- [ ] APFS 快照列表与按旧 xid 恢复删除文件
+- [ ] APFS 加密卷（keybag + AES-XTS）
 - [ ] Windows 后端（`PhysicalDrive`）
 - [ ] 分区表/GPT 导出与写回（带二次确认）
 
@@ -322,7 +354,7 @@ NTFS 没有可用的 mkntfs，所以测试里**按规范逐字节构造**了一�
 | 平台 | macOS / Linux（Windows 规划） | Windows / macOS / Linux / DOS |
 | 扇区编辑 | 未实现 | 完整 |
 | 文件系统覆盖 | FAT/exFAT/NTFS/ext/HFS+ | 更多（ReFS、UFS、Btrfs、XFS…） |
-| APFS | 仅识别 | 支持 |
+| APFS | 浏览/导出（不含快照恢复） | 支持 |
 | RAID 重建 | 未实现 | 支持 |
 | 代码可审计 | 是（零依赖核心） | 闭源 |
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 pub fn ls(o: &Opts) -> Result<(), String> {
     let source = o.positional.first().ok_or("ls 需要指定源")?;
     let path = o.positional.get(1).map(|s| s.as_str()).unwrap_or("/");
-    let opened = open_fs(source, o.partition, o.offset, o.size)?;
+    let opened = open_fs(source, o.partition, o.offset, o.size, o.volume)?;
     let fs = &opened.fs;
 
     let mut entries = if path == "/" || path.is_empty() {
@@ -43,7 +43,7 @@ pub fn ls(o: &Opts) -> Result<(), String> {
 pub fn tree(o: &Opts) -> Result<(), String> {
     let source = o.positional.first().ok_or("tree 需要指定源")?;
     let path = o.positional.get(1).map(|s| s.as_str()).unwrap_or("/");
-    let opened = open_fs(source, o.partition, o.offset, o.size)?;
+    let opened = open_fs(source, o.partition, o.offset, o.size, o.volume)?;
     let fs = &opened.fs;
     let root = if path == "/" || path.is_empty() {
         fs.root()
@@ -114,7 +114,7 @@ fn walk(
 pub fn cat(o: &Opts) -> Result<(), String> {
     let source = o.positional.first().ok_or("cat 需要指定源")?;
     let path = o.positional.get(1).ok_or("cat 需要指定文件路径")?;
-    let opened = open_fs(source, o.partition, o.offset, o.size)?;
+    let opened = open_fs(source, o.partition, o.offset, o.size, o.volume)?;
     let fs = &opened.fs;
     let entry = resolve(fs, path)
         .map_err(|e| e.to_string())?
@@ -143,7 +143,7 @@ pub fn extract(o: &Opts) -> Result<(), String> {
     let source = o.positional.first().ok_or("extract 需要指定源")?;
     let path = o.positional.get(1).map(|s| s.as_str()).unwrap_or("/");
     let outdir = o.out.as_ref().ok_or("extract 必须用 -o 指定输出目录")?;
-    let opened = open_fs(source, o.partition, o.offset, o.size)?;
+    let opened = open_fs(source, o.partition, o.offset, o.size, o.volume)?;
     let fs = &opened.fs;
 
     let entry = if path == "/" || path.is_empty() {
