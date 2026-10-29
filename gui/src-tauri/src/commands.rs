@@ -254,7 +254,24 @@ pub fn do_export_entry(
     Ok((st, dest))
 }
 
-/// 导出单个文件（UI 里选中一个文件后点「导出」走这里）。
+/// 单文件导出的结果文案（成功 / 暂停 / 跳过 / 失败各有说法）。
+fn single_export_result(st: &ExportStats, name: &str, dest: &Path) -> Result<String, String> {
+    if st.cancelled {
+        return Ok(format!(
+            "已暂停导出 {name}（未写完的部分改名为 {}.partial）",
+            dest.display()
+        ));
+    }
+    if st.skipped > 0 {
+        return Ok(format!("{name} 已存在于输出目录，按当前策略跳过"));
+    }
+    if st.files == 0 {
+        return Err(format!("导出失败：{name}（读盘出错或目标不可写）"));
+    }
+    Ok(format!("已导出 {} → {}（{}）", name, dest.display(), dmdisk::human_size(st.bytes)))
+}
+
+/// 导出单个文件（列表行内「导出」按钮走这里）。
 ///
 /// 单文件也可能是几个 GB，所以和目录导出一样 async + spawn_blocking；
 /// 冲突策略、暂停、`.partial` 语义全部复用 `export_file`，行为与目录导出一致。
@@ -268,94 +285,11 @@ pub async fn export_entry(
     on_conflict: Option<String>,
 ) -> Result<String, String> {
     let conflict = Conflict::parse(on_conflict.as_deref());
-    let backend = {
-        let mut g = state.backend.lock().map_err(|_| not_open())?;
-        g.take().ok_or_else(not_open)?
-    };
-    // 清掉上一轮可能残留的暂停标志，否则这次一进来就"暂停"
-    state.export_cancel.store(false, Ordering::SeqCst);
-    set_busy(&state, Some("导出文件"));
-    let flag = state.export_cancel.clone();
-    let handle = app.clone();
-    // 文件名要留一份给外层的提示文案，闭包里只借它的副本
-    let task_name = name.clone();
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        let mut b = backend;
-        let mut last = std::time::Instant::now();
-        let r = do_export_entry(&mut b, id, &task_name, &out_dir, &flag, conflict, &mut |st, cur| {
-            if last.elapsed().as_millis() >= 120 {
-                last = std::time::Instant::now();
-                let _ = tauri::Emitter::emit(
-                    &handle,
-                    "export-progress",
-                    ExportProgress {
-                        files: st.files,
-                        dirs: st.dirs,
-                        failed: st.failed,
-                        skipped: st.skipped,
-                        skipped_rule: st.skipped_rule,
-                        bytes: st.bytes,
-                        current: cur.to_string(),
-                        done: false,
-                        cancelled: st.cancelled,
-                    },
-                );
-            }
-        });
-        (b, r)
+    run_export_task(app, state, "导出文件", move |b, cancel, progress| {
+        let (st, dest) = do_export_entry(b, id, &name, &out_dir, cancel, conflict, progress)?;
+        single_export_result(&st, &name, &dest)
     })
-    .await;
-
-    set_busy(&state, None);
-    match joined {
-        Ok((b, Ok((st, dest)))) => {
-            {
-                let mut g = state.backend.lock().map_err(|_| not_open())?;
-                *g = Some(b);
-            }
-            let _ = tauri::Emitter::emit(
-                &app,
-                "export-progress",
-                ExportProgress { done: true, cancelled: st.cancelled, ..Default::default() },
-            );
-            if st.cancelled {
-                return Ok(format!(
-                    "已暂停导出 {name}（未写完的部分改名为 {}.partial）",
-                    dest.display()
-                ));
-            }
-            if st.skipped > 0 {
-                return Ok(format!("{name} 已存在于输出目录，按当前策略跳过"));
-            }
-            if st.files == 0 {
-                return Err(format!("导出失败：{name}（读盘出错或目标不可写）"));
-            }
-            Ok(format!(
-                "已导出 {} → {}（{}）",
-                name,
-                dest.display(),
-                dmdisk::human_size(st.bytes)
-            ))
-        }
-        Ok((b, Err(e))) => {
-            let mut g = state.backend.lock().map_err(|_| not_open())?;
-            *g = Some(b);
-            let _ = tauri::Emitter::emit(
-                &app,
-                "export-progress",
-                ExportProgress { done: true, ..Default::default() },
-            );
-            Err(e)
-        }
-        Err(e) => {
-            let _ = tauri::Emitter::emit(
-                &app,
-                "export-progress",
-                ExportProgress { done: true, ..Default::default() },
-            );
-            Err(format!("导出任务异常: {e}"))
-        }
-    }
+    .await
 }
 
 /// 批量恢复：先把已删除条目全扫一遍，再逐个读出来写盘。
@@ -789,36 +723,128 @@ pub fn cancel_export(state: tauri::State<AppState>) -> Result<bool, String> {
     Ok(true)
 }
 
-/// 导出当前路径（目录递归或单文件）到 `out_dir`，边导边通过事件上报进度。
-#[tauri::command]
-pub async fn export_path(
+/// 前端提交的一个待导出条目。
+///
+/// 用 id 而不是路径定位：已删除条目在目录树里已经查不到，只有会话 id 可靠。
+/// `name` 决定输出文件名，`is_dir` 决定走递归还是单文件。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct ExportItem {
+    pub id: u64,
+    pub path: String,
+    pub name: String,
+    pub is_dir: bool,
+}
+
+/// 导出统计的收尾文案（三处导出共用，避免各写一份、文案互相对不上）。
+fn export_summary(st: &ExportStats, dest: &Path) -> String {
+    let mut extra = String::new();
+    if st.skipped > 0 {
+        extra.push_str(&format!("、跳过 {} 个（目标已存在）", st.skipped));
+    }
+    if st.skipped_rule > 0 {
+        extra.push_str(&format!("、按规则跳过 {} 个（依赖/缓存目录，未读盘）", st.skipped_rule));
+    }
+    if st.cancelled {
+        extra.push_str("；已按你的要求暂停（未写完的文件改名为 .partial）");
+    }
+    format!(
+        "{} {}：{} 个文件、{} 个目录、{} 个失败{}，共 {}",
+        if st.cancelled { "已暂停导出到" } else { "已导出到" },
+        dest.display(),
+        st.files,
+        st.dirs,
+        st.failed,
+        extra,
+        dmdisk::human_size(st.bytes)
+    )
+}
+
+/// 把一组选中项导出到 `out_dir`：目录按子树递归，文件只导自己。
+///
+/// 这是「挑着恢复」的真正主路径——用户经常只想捞两三个目录（比如几台虚拟机），
+/// 而不是整个父目录。所有条目共用一份统计、一个暂停标志、一套冲突策略；
+/// 暂停后已经导完的部分完整保留。
+pub fn do_export_items(
+    b: &mut Backend,
+    items: &[ExportItem],
+    out_dir: &str,
+    cancel: &AtomicBool,
+    conflict: Conflict,
+    rules: &SkipRules,
+    on_progress: &mut dyn FnMut(&ExportStats, &str),
+) -> Result<String, String> {
+    if items.is_empty() {
+        return Err("没有选中任何条目".into());
+    }
+    let root = PathBuf::from(out_dir);
+    fs::create_dir_all(&root).map_err(|e| format!("无法创建输出目录 {out_dir}: {e}"))?;
+    let mut st = ExportStats::default();
+    for it in items {
+        if cancel.load(Ordering::Relaxed) {
+            st.cancelled = true;
+            break;
+        }
+        let name = sanitize_name(&it.name);
+        if name.is_empty() {
+            st.failed += 1;
+            continue;
+        }
+        let dest = root.join(&name);
+        if it.is_dir {
+            // export_dir 自己建目录、自己 +1 目录数，这里不要重复统计
+            export_dir(b, &it.path, &dest, &mut st, 1, cancel, conflict, rules, on_progress);
+        } else {
+            // 用户已经明确点了这个文件：不套跳过规则，哪怕它命中 *.log
+            let entry = EntryDto {
+                name: it.name.clone(),
+                path: it.path.clone(),
+                id: it.id,
+                is_dir: false,
+                size: 0,
+                size_human: String::new(),
+                deleted: false,
+                mtime: None,
+                name_lost: false,
+            };
+            export_file(b, &entry, &dest, &mut st, cancel, conflict, on_progress);
+        }
+        if st.cancelled {
+            break;
+        }
+    }
+    Ok(export_summary(&st, &root))
+}
+
+/// 导出任务的统一外壳：独占 backend、跑在阻塞线程、节流发进度、结束后归位。
+///
+/// 三种导出（当前目录 / 选中项 / 单个文件）只差中间「具体导什么」，
+/// 其余全一样——抽出来，免得三份代码各自演变出不同的暂停、异常行为。
+async fn run_export_task<F>(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
-    path: String,
-    out_dir: String,
-    on_conflict: Option<String>,
-    skip_rules: Option<String>,
-) -> Result<String, String> {
-    let conflict = Conflict::parse(on_conflict.as_deref());
-    // `skip_rules` 不传 = 用默认规则（跳过 node_modules 等）；
-    // 传空串 = 用户把列表清空了，表示「全都要」，一条也不跳。
-    let rules = SkipRules::from_opt(skip_rules.as_deref());
+    busy: &'static str,
+    job: F,
+) -> Result<String, String>
+where
+    F: FnOnce(&mut Backend, &AtomicBool, &mut dyn FnMut(&ExportStats, &str)) -> Result<String, String>
+        + Send
+        + 'static,
+{
     // 把后端独占取出：既避免跨线程借用，也保证导出期间不会被别的命令插队
     let backend = {
         let mut g = state.backend.lock().map_err(|_| not_open())?;
         g.take().ok_or_else(not_open)?
     };
-
     // 清掉上一轮可能残留的暂停标志，否则这次一开始就会立刻"暂停"
     state.export_cancel.store(false, Ordering::SeqCst);
-    set_busy(&state, Some("导出文件"));
+    set_busy(&state, Some(busy));
     let flag = state.export_cancel.clone();
-
     let handle = app.clone();
+
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let mut b = backend;
         let mut last = std::time::Instant::now();
-        let res = do_export_with(&mut b, &path, &out_dir, &flag, conflict, &rules, &mut |st, cur| {
+        let res = job(&mut b, &flag, &mut |st: &ExportStats, cur: &str| {
             // 节流：导出几万个小文件时，每个都发事件会把 WebView 拖死
             if last.elapsed().as_millis() >= 120 {
                 last = std::time::Instant::now();
@@ -865,6 +891,44 @@ pub async fn export_path(
             Err(format!("导出任务异常: {e}"))
         }
     }
+}
+
+/// 导出当前路径（目录递归或单文件）到 `out_dir`，边导边通过事件上报进度。
+#[tauri::command]
+pub async fn export_path(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    path: String,
+    out_dir: String,
+    on_conflict: Option<String>,
+    skip_rules: Option<String>,
+) -> Result<String, String> {
+    let conflict = Conflict::parse(on_conflict.as_deref());
+    // `skip_rules` 不传 = 用默认规则（跳过 node_modules 等）；
+    // 传空串 = 用户把列表清空了，表示「全都要」，一条也不跳。
+    let rules = SkipRules::from_opt(skip_rules.as_deref());
+    run_export_task(app, state, "导出文件", move |b, cancel, progress| {
+        do_export_with(b, &path, &out_dir, cancel, conflict, &rules, progress)
+    })
+    .await
+}
+
+/// 导出选中的多个条目（文件与目录可以混在一起）。
+#[tauri::command]
+pub async fn export_items(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    items: Vec<ExportItem>,
+    out_dir: String,
+    on_conflict: Option<String>,
+    skip_rules: Option<String>,
+) -> Result<String, String> {
+    let conflict = Conflict::parse(on_conflict.as_deref());
+    let rules = SkipRules::from_opt(skip_rules.as_deref());
+    run_export_task(app, state, "导出选中项", move |b, cancel, progress| {
+        do_export_items(b, &items, &out_dir, cancel, conflict, &rules, progress)
+    })
+    .await
 }
 
 /// 导出核心（与 Tauri 解耦，便于直接测试）。默认冲突策略：跳过已存在。
@@ -936,26 +1000,7 @@ pub fn do_export_with(
         export_file(b, &entry, &dest, &mut st, cancel, conflict, on_progress);
     }
 
-    let mut extra = String::new();
-    if st.skipped > 0 {
-        extra.push_str(&format!("、跳过 {} 个（目标已存在）", st.skipped));
-    }
-    if st.skipped_rule > 0 {
-        extra.push_str(&format!("、按规则跳过 {} 个（依赖/缓存目录，未读盘）", st.skipped_rule));
-    }
-    if st.cancelled {
-        extra.push_str("；已按你的要求暂停（未写完的文件改名为 .partial）");
-    }
-    Ok(format!(
-        "{} {}：{} 个文件、{} 个目录、{} 个失败{}，共 {}",
-        if st.cancelled { "已暂停导出到" } else { "已导出到" },
-        dest.display(),
-        st.files,
-        st.dirs,
-        st.failed,
-        extra,
-        dmdisk::human_size(st.bytes)
-    ))
+    Ok(export_summary(&st, &dest))
 }
 
 

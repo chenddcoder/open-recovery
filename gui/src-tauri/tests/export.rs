@@ -386,3 +386,66 @@ fn export_single_file_respects_conflict() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// 多选导出：文件与目录可以混在一起，一次导出。
+/// 这是界面上「导出选中的 N 项」的底层实现——通常用来只捞几台虚拟机目录，
+/// 而不是整个父目录。
+#[test]
+fn export_selected_items_mixes_files_and_dirs() {
+    use dmde_gui_lib::commands::{do_export_items, Conflict, ExportItem};
+    use dmde_gui_lib::skip::SkipRules;
+    use std::sync::atomic::AtomicBool;
+
+    let Some(img) = image() else {
+        eprintln!("跳过：测试镜像不存在");
+        return;
+    };
+    let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+    let all = b.list_dir("/", false).expect("列根目录");
+    let file = all.iter().find(|e| e.name == "readme.txt").expect("应有 readme.txt");
+    let dir = all.iter().find(|e| e.name == "sub").expect("应有 sub 目录");
+
+    let out = std::env::temp_dir().join(format!("dmde-export-items-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+
+    let items = vec![
+        ExportItem {
+            id: file.id,
+            path: file.path.clone(),
+            name: file.name.clone(),
+            is_dir: false,
+        },
+        ExportItem {
+            id: dir.id,
+            path: dir.path.clone(),
+            name: dir.name.clone(),
+            is_dir: true,
+        },
+    ];
+    let msg = do_export_items(
+        &mut b,
+        &items,
+        out.to_str().unwrap(),
+        &AtomicBool::new(false),
+        Conflict::Skip,
+        &SkipRules::parse(""),
+        &mut |_, _| {},
+    )
+    .expect("混合导出应成功");
+    eprintln!("{msg}");
+
+    assert_eq!(
+        std::fs::read_to_string(out.join("readme.txt")).unwrap(),
+        "apfs hello\n",
+        "选中的文件要原样导出"
+    );
+    assert!(
+        out.join("sub/deeper/n.txt").exists(),
+        "选中的目录要保留子树结构"
+    );
+    // readme.txt + sub/keep.bin + sub/deeper/n.txt
+    assert!(msg.contains("3 个文件"), "汇总应统计到 3 个文件: {msg}");
+
+    let _ = std::fs::remove_dir_all(&out);
+}

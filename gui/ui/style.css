@@ -141,13 +141,16 @@ button.ghost { background: transparent; }
 .crumbs button { padding: 2px 6px; background: transparent; border: none; color: var(--accent); }
 .crumbs span.sep { color: var(--text-dim); }
 .tool-group { display: flex; align-items: center; gap: 8px; }
+.sel-hint { font-size: 10.5px; color: var(--text-dim); white-space: nowrap; opacity: .85; }
 .toggle { display: flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text-dim); cursor: pointer; }
 .toggle input { accent-color: var(--accent); }
 
 .table-head, .row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 96px 152px 84px;
-  gap: 10px;
+  /* 名称 / 大小 / 修改时间 / 导出。中间栏只有 400 多像素，
+     后三列能压就压——文件名比「%Y-%m-%d %H:%M」值钱。 */
+  grid-template-columns: minmax(0, 1fr) 72px 118px 46px;
+  gap: 8px;
   padding: 6px 14px;
   align-items: center;
 }
@@ -163,12 +166,27 @@ button.ghost { background: transparent; }
 }
 .row:hover { background: #161c26; }
 .row.selected { background: #17233a; }
-.row .col-name { display: flex; align-items: center; gap: 7px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.row .col-name { display: flex; align-items: center; gap: 7px; overflow: hidden; white-space: nowrap; }
+/* 文件名自己吃省略号，别让"目录/已删除"标记被挤出去 */
+.row .col-name .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.row .col-name .tag { flex: none; }
 .row .col-size, .row .col-time { color: var(--text-dim); font-family: var(--mono); font-size: 11.5px; }
 .row.is-dir .col-name { color: #9dc4ff; cursor: pointer; }
 .tag { font-size: 10px; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-dim); }
 .tag.deleted { color: var(--danger); border-color: #4a2226; background: #251417; }
 .tag.dir { color: var(--accent); border-color: var(--accent-dim); }
+
+/* 行内「导出」：单文件的显式入口，必须常驻可见。
+   用低调的描边按钮，别把目录列表搞成一片蓝色 */
+.col-act { text-align: right; }
+button.mini {
+  padding: 1px 6px; font-size: 10px; line-height: 1.5;
+  border-radius: 4px; background: transparent; color: var(--accent);
+  border-color: var(--accent-dim); font-family: inherit;
+}
+button.mini:hover:not(:disabled) { background: #14243d; color: #cfe3ff; }
+/* 导出进行中：列表整体禁点，避免边导边换目录/重复触发 */
+#entries.busy { pointer-events: none; opacity: .55; }
 .empty { color: var(--text-dim); text-align: center; margin-top: 60px; font-size: 12.5px; }
 .icon { width: 14px; text-align: center; opacity: .8; }
 

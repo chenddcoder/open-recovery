@@ -6,7 +6,11 @@ const state = {
   path: "/",
   showDeleted: false,
   entries: [],
-  selected: null,
+  // 选中项可以多个（文件、目录混选）：恢复时经常只想捞两三个目录，
+  // 而不是整个父目录。单选是它的特例。
+  selection: [],
+  // 上一次单击的列表下标，Shift 选一段时当锚点
+  anchor: null,
   outDir: "",
 };
 
@@ -181,29 +185,37 @@ async function navigate(path) {
 }
 
 function clearSelection() {
-  state.selected = null;
-  document.querySelectorAll(".row.selected").forEach((r) => r.classList.remove("selected"));
-  $("preview-meta").textContent = "未选择文件";
-  $("preview-body").textContent = "";
+  state.selection = [];
+  state.anchor = null;
+  paintSelection();
+  refreshPreview();
+}
+
+/// 把选中状态刷到行上：只改 class，不重建 DOM（否则滚动位置会跳）。
+function paintSelection() {
+  const chosen = new Set(state.selection.map((e) => e.path));
+  document.querySelectorAll(".row").forEach((r) => {
+    r.classList.toggle("selected", chosen.has(r.dataset.path || ""));
+  });
   updateExportTarget();
 }
 
-/// 一个「导出」按钮，按选中项决定导什么。之前只有「导出当前目录」，
-/// 想单独捞一个文件只能点「保存选中文件」——而那条路是同步读写，
-/// 几 GB 的文件会把窗口卡死，也不支持暂停。现在统一成一个入口。
+/// 一个「导出」按钮，按选中项决定导什么：
+/// 0 项 → 当前目录；1 个文件 → 只导这一个；1 个目录 → 整棵子树；多项 → 选中项集合。
 function updateExportTarget() {
   const b = $("btn-export");
   if (!b) return;
-  const sel = state.selected;
-  if (sel && sel.is_dir) {
-    b.textContent = "导出选中目录（含子目录）";
-    b.title = `${sel.path} → 整棵子树`;
-  } else if (sel) {
-    b.textContent = `导出选中文件：${sel.name}`;
-    b.title = `${sel.path} → 只导这一个文件`;
-  } else {
+  const n = state.selection.length;
+  if (n === 0) {
     b.textContent = "导出当前目录（含子目录）";
-    b.title = `${state.path} → 整棵子树`;
+    b.title = state.path;
+  } else if (n === 1) {
+    const e = state.selection[0];
+    b.textContent = e.is_dir ? "导出选中目录（含子目录）" : `导出选中文件：${e.name}`;
+    b.title = `${e.path} → ${e.is_dir ? "整棵子树" : "只导这一个文件"}`;
+  } else {
+    b.textContent = `导出选中的 ${n} 项`;
+    b.title = state.selection.map((e) => e.path).join("\n");
   }
 }
 
@@ -267,16 +279,36 @@ function renderEntries(items) {
   for (const e of items) {
     const row = document.createElement("div");
     row.className = "row" + (e.is_dir ? " is-dir" : "");
+    row.dataset.path = e.path;
     row.innerHTML = `
-      <span class="col-name"><span class="icon">${iconFor(e)}</span>${e.name}</span>
+      <span class="col-name"><span class="icon">${iconFor(e)}</span><span class="nm">${e.name}</span>${
+        // 「目录」标签冗余（▸ + 蓝字已经说明了），只在「已删除」这种有信息量时占位
+        e.deleted ? '<span class="tag deleted">已删除</span>' : ""
+      }</span>
       <span class="col-size">${e.is_dir ? "-" : fmtSize(e.size)}</span>
       <span class="col-time">${fmtTime(e.mtime)}</span>
-      <span class="col-tag">${e.deleted ? '<span class="tag deleted">已删除</span>' : e.is_dir ? '<span class="tag dir">目录</span>' : ""}</span>`;
-    row.onclick = () => selectEntry(e, row);
+      <span class="col-act"></span>`;
+    // 单文件导出的显式入口：每行常驻一个小按钮。
+    // 之前只有一个"随选中项变文案"的主按钮，选了目录就完全看不到单文件入口，
+    // 用户会以为这功能不存在——入口必须一直看得见。
+    if (!e.is_dir) {
+      const act = row.querySelector(".col-act");
+      const b = document.createElement("button");
+      b.className = "mini";
+      b.textContent = "导出";
+      b.title = `只导出这个文件：${e.path}`;
+      b.onclick = (ev) => {
+        ev.stopPropagation(); // 别顺手把整行选中/触发预览
+        runExport([e]);
+      };
+      act.appendChild(b);
+    }
+    row.onclick = (ev) => pickEntry(e, ev);
     row.ondblclick = () => { if (e.is_dir) navigate(e.path); };
     box.appendChild(row);
   }
   updateStats();
+  paintSelection();
 }
 
 function updateStats() {
@@ -285,23 +317,63 @@ function updateStats() {
   $("stats").textContent = `${state.entries.length} 项 · ${files.length} 个文件 · ${fmtSize(total)}`;
 }
 
-async function selectEntry(e, row) {
-  document.querySelectorAll(".row.selected").forEach((r) => r.classList.remove("selected"));
-  row?.classList.add("selected");
-  state.selected = e;
-  updateExportTarget();
-  $("preview-meta").textContent = `${e.path} · ${e.is_dir ? "目录" : fmtSize(e.size)}`;
-  if (e.is_dir) {
-    $("preview-body").textContent = "目录：双击进入";
+/// 点击选条目：普通点击单选，⌘/Ctrl 点击加选或取消，Shift 点击选一段。
+function pickEntry(e, ev) {
+  const idx = state.entries.findIndex((x) => x.path === e.path);
+  if (ev.shiftKey && state.anchor != null) {
+    const [a, b] = [state.anchor, idx].sort((x, y) => x - y);
+    state.selection = state.entries.slice(a, b + 1);
+  } else if (ev.metaKey || ev.ctrlKey) {
+    const at = state.selection.findIndex((x) => x.path === e.path);
+    if (at >= 0) state.selection.splice(at, 1);
+    else state.selection.push(e);
+    state.anchor = idx;
+  } else {
+    state.selection = [e];
+    state.anchor = idx;
+  }
+  paintSelection();
+  refreshPreview();
+}
+
+// 快速点选时，前一次预览可能后返回、把新的覆盖掉；用 token 作废过期结果
+let previewToken = 0;
+
+/// 预览面板跟着选中项走：单选显示内容，多选只报数量与合计大小。
+async function refreshPreview() {
+  const token = ++previewToken;
+  const meta = $("preview-meta");
+  const body = $("preview-body");
+  const sel = state.selection;
+  if (!sel.length) {
+    meta.textContent = "未选择文件";
+    body.textContent = "";
     return;
   }
-  $("preview-body").textContent = "读取中…";
+  if (sel.length > 1) {
+    const files = sel.filter((e) => !e.is_dir);
+    const total = files.reduce((s, e) => s + e.size, 0);
+    meta.textContent = `已选 ${sel.length} 项 · ${files.length} 个文件 · ${fmtSize(total)}`;
+    body.textContent =
+      `准备导出 ${sel.length} 个条目（${sel.length - files.length} 个目录 / ${files.length} 个文件）。\n\n` +
+      `⌘ 点击加选，Shift 点击选一段，⌘A 全选。`;
+    return;
+  }
+  const e = sel[0];
+  meta.textContent = `${e.path} · ${e.is_dir ? "目录" : fmtSize(e.size)}`;
+  if (e.is_dir) {
+    body.textContent = "目录：双击进入";
+    return;
+  }
+  body.textContent = "读取中…";
   try {
     const p = await invoke("preview", { id: e.id, path: e.path, max: 256 * 1024 });
+    if (token !== previewToken) return; // 已经改成别的选中项了
     const head = p.truncated ? `（仅显示前 256 KiB，文件共 ${fmtSize(p.size)}）\n\n` : "";
-    $("preview-body").textContent = head + p.text;
+    body.textContent = head + p.text;
   } catch (err) {
-    $("preview-body").textContent = "预览失败：" + err;
+    if (token !== previewToken) return;
+    body.textContent = "预览失败：" + err;
   }
 }
 
@@ -363,8 +435,9 @@ $("btn-cancel-export").onclick = async () => {
   }
 };
 
-// 导出当前浏览的目录（递归）；这是"挑着恢复"的主入口
-$("btn-export").onclick = async () => {
+// 导出统一入口。picked 可以是一个条目、一组条目，或空（= 导出当前目录）。
+// 行内「导出」小按钮传 [e]，右侧主按钮传 state.selection，避免两套逻辑走偏。
+async function runExport(picked) {
   if (!state.source) {
     setStatus("先打开一个源", "error");
     return;
@@ -384,18 +457,25 @@ $("btn-export").onclick = async () => {
       localStorage.setItem("dmde.skipRules", skipRules);
     } catch (_) {}
   }
-  // 选中文件 → 只导这一个（按 id 读，已删除条目也能导出；不套跳过规则）；
-  // 选中目录 / 未选中 → 走整棵子树导出（有遍历、有跳过规则）
-  const picked = state.selected;
-  const single = picked && !picked.is_dir ? picked : null;
-  const p = single ? single.path : (picked && picked.is_dir ? picked.path : state.path || "/");
-  setStatus(single ? `正在导出文件 ${p} …` : `正在导出 ${p} …`);
+  const list = Array.isArray(picked) ? picked.slice() : picked ? [picked] : [];
+  // 单个文件 → 只导这一个（按 id 读，已删除条目也能导出；不套跳过规则）；
+  // 其余 → 目录递归 / 多项集合（有遍历、有跳过规则）
+  const single = list.length === 1 && !list[0].is_dir ? list[0] : null;
+  const label =
+    list.length === 0
+      ? `正在导出 ${state.path || "/"} …`
+      : single
+      ? `正在导出文件 ${single.path} …`
+      : `正在导出 ${list.length} 个选中项 …`;
+  setStatus(label);
   const btn = $("btn-export");
   const up = $("btn-up");
   const stop = $("btn-cancel-export");
   btn.disabled = true;
   if (sel) sel.disabled = true;
   if (up) up.disabled = true;
+  // 导出期间列表整体禁点：行内「导出」按钮和目录切换都不该在半路插队
+  $("entries").classList.add("busy");
   stop.hidden = false;
   stop.disabled = false;
   stop.textContent = "暂停导出";
@@ -404,14 +484,31 @@ $("btn-export").onclick = async () => {
   box.hidden = false;
   $("export-progress-text").textContent = "正在准备…";
   try {
-    const msg = single
-      ? await invoke("export_entry", {
-          id: single.id,
-          name: single.name,
-          outDir,
-          onConflict,
-        })
-      : await invoke("export_path", { path: p, outDir, onConflict, skipRules });
+    let msg;
+    if (list.length === 0) {
+      msg = await invoke("export_path", {
+        path: state.path || "/",
+        outDir,
+        onConflict,
+        skipRules,
+      });
+    } else if (single) {
+      msg = await invoke("export_entry", {
+        id: single.id,
+        name: single.name,
+        outDir,
+        onConflict,
+      });
+    } else {
+      // 只把后端需要的四个字段传过去，别把预览缓存之类的内部字段带上
+      const items = list.map((e) => ({
+        id: e.id,
+        path: e.path,
+        name: e.name,
+        is_dir: !!e.is_dir,
+      }));
+      msg = await invoke("export_items", { items, outDir, onConflict, skipRules });
+    }
     // 后端会在消息里写明是"已暂停"还是"已导出"，直接透出
     setStatus(msg, msg.startsWith("已暂停") ? "" : "ok");
   } catch (e) {
@@ -422,9 +519,12 @@ $("btn-export").onclick = async () => {
     btn.disabled = false;
     if (up) up.disabled = false;
     if (sel) sel.disabled = false;
+    $("entries").classList.remove("busy");
     stop.hidden = true;
   }
-};
+}
+
+$("btn-export").onclick = () => runExport(state.selection);
 // 覆盖是唯一会动到已有文件的策略，选中时把警告显出来
 $("sel-conflict").onchange = (ev) => {
   $("conflict-hint").hidden = ev.target.value !== "overwrite";
@@ -445,6 +545,22 @@ $("btn-up").onclick = () => {
   navigate("/" + parts.join("/"));
 };
 $("btn-recover").onclick = recoverAll;
+
+// 列表快捷键：⌘A 全选当前目录、Esc 清空选择。
+// 输入框里打字时不要抢这两个键。
+document.addEventListener("keydown", (ev) => {
+  const tag = (ev.target.tagName || "").toLowerCase();
+  if (tag === "input" || tag === "select" || tag === "textarea") return;
+  if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "a") {
+    ev.preventDefault();
+    state.selection = state.entries.slice();
+    state.anchor = 0;
+    paintSelection();
+    refreshPreview();
+  } else if (ev.key === "Escape") {
+    clearSelection();
+  }
+});
 
 (async () => {
   try {
