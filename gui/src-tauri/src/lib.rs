@@ -36,6 +36,8 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
+            commands::boot_path,
+            commands::ui_log,
             commands::list_disks,
             commands::open_source,
             commands::list_dir,

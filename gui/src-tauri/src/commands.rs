@@ -33,6 +33,39 @@ fn set_busy(state: &AppState, what: Option<&str>) {
     }
 }
 
+/// 调试用：`DMDE_OPEN_ON_START=<镜像路径>` 时启动即打开该源。
+///
+/// 只是为了能在没有鼠标自动化的情况下复现"打开后列表不刷新"这类前端问题。
+#[tauri::command]
+pub fn boot_path() -> Option<String> {
+    std::env::var("DMDE_OPEN_ON_START").ok().filter(|s| !s.is_empty())
+}
+
+/// 前端关键路径日志。
+///
+/// WebView 的 console 我们在外面看不到，出了问题只能猜。
+/// 这个命令把事件追加到 `~/Library/Application Support/dmde-rs/ui.log`，
+/// 排查"打开了但列表不刷新"这类问题时能直接看时间线。
+#[tauri::command]
+pub fn ui_log(msg: String) {
+    let dir = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join("Library/Application Support/dmde-rs"))
+        .unwrap_or_else(|_| std::env::temp_dir());
+    let _ = std::fs::create_dir_all(&dir);
+    let line = format!(
+        "[{}] {}\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        msg
+    );
+    use std::io::Write;
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(dir.join("ui.log")) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
 /// 列出本机物理磁盘（`diskutil` 查询，不需要 root，也不会碰设备）。
 #[tauri::command]
 pub fn list_disks() -> Result<Vec<dmrpc::DiskDto>, String> {
@@ -195,45 +228,66 @@ pub fn save_file(
     }
 }
 
+/// 批量恢复：先把已删除条目全扫一遍，再逐个读出来写盘。
+/// 全程可能要几分钟（APFS 要遍历整棵 fs-tree），所以和 scan_deleted 一样
+/// 放到阻塞线程池里跑，否则 Tauri 主线程会被卡住、窗口直接无响应。
 #[tauri::command]
-pub fn recover_all(
-    state: tauri::State<AppState>,
+pub async fn recover_all(
+    state: tauri::State<'_, AppState>,
     out_dir: String,
     min_size: u64,
     limit: usize,
 ) -> Result<RecoverDto, String> {
-    let mut guard = state.backend.lock().map_err(|_| not_open())?;
-    let b = guard.as_mut().ok_or_else(not_open)?;
+    let mut backend = {
+        let mut g = state.backend.lock().map_err(|_| not_open())?;
+        g.take().ok_or_else(not_open)?
+    };
     fs::create_dir_all(&out_dir).map_err(|e| format!("创建 {out_dir} 失败: {e}"))?;
-    let mut items = b.deleted(0)?;
-    items.retain(|e| !e.is_dir && e.size >= min_size);
-    if limit > 0 {
-        items.truncate(limit);
-    }
-    let mut ok = 0u64;
-    let mut failed = 0u64;
-    let mut bytes = 0u64;
-    let mut saved = Vec::new();
-    for e in &items {
-        // 批量恢复一律「改名保留两份」：这里的文件都是刚从盘里捞出来的，
-        // 覆盖掉输出目录里同名的旧结果风险太大
-        match dump_to_dir(b, e.id, &e.name, &out_dir, Conflict::Rename) {
-            Ok(Some((p, n))) => {
-                ok += 1;
-                bytes += n;
-                saved.push(p.display().to_string());
+    set_busy(&state, Some("批量恢复已删除"));
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let r = (|| -> Result<RecoverDto, String> {
+            let mut items = backend.deleted(0)?;
+            items.retain(|e| !e.is_dir && e.size >= min_size);
+            if limit > 0 {
+                items.truncate(limit);
             }
-            Ok(None) | Err(_) => failed += 1,
-        }
-    }
-    Ok(RecoverDto {
-        ok,
-        failed,
-        bytes,
-        bytes_human: dmdisk::human_size(bytes),
-        out_dir,
-        saved,
+            let mut ok = 0u64;
+            let mut failed = 0u64;
+            let mut bytes = 0u64;
+            let mut saved = Vec::new();
+            for e in &items {
+                // 批量恢复一律「改名保留两份」：这里的文件都是刚从盘里捞出来的，
+                // 覆盖掉输出目录里同名的旧结果风险太大
+                match dump_to_dir(&mut backend, e.id, &e.name, &out_dir, Conflict::Rename) {
+                    Ok(Some((p, n))) => {
+                        ok += 1;
+                        bytes += n;
+                        saved.push(p.display().to_string());
+                    }
+                    Ok(None) | Err(_) => failed += 1,
+                }
+            }
+            Ok(RecoverDto {
+                ok,
+                failed,
+                bytes,
+                bytes_human: dmdisk::human_size(bytes),
+                out_dir: out_dir.clone(),
+                saved,
+            })
+        })();
+        (backend, r)
     })
+    .await;
+    set_busy(&state, None);
+    match joined {
+        Ok((b, r)) => {
+            let mut g = state.backend.lock().map_err(|_| not_open())?;
+            *g = Some(b);
+            r
+        }
+        Err(e) => Err(format!("恢复任务异常: {e}")),
+    }
 }
 
 /// 默认输出目录：`~/Downloads/dmde-rs-recovered`

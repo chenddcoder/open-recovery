@@ -231,19 +231,3 @@ button.danger:hover:not(:disabled) {
   border-color: var(--danger);
   background: #2a1616;
 }
-
-/* 扫描结果的顶部横幅：一眼看出"这不是目录视图" */
-.notice {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 7px 10px;
-  margin: 0 0 6px;
-  border: 1px solid #4a3c1f;
-  background: #241f10;
-  border-radius: 6px;
-  font-size: 11.5px;
-  color: var(--warn);
-}
-.notice button { padding: 3px 9px; font-size: 11px; flex: none; }

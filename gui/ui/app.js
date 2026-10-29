@@ -7,7 +7,6 @@ const state = {
   showDeleted: false,
   entries: [],
   selected: null,
-  mode: "browse", // browse | deleted
   outDir: "",
 };
 
@@ -60,22 +59,43 @@ async function loadDisks() {
   }
 }
 
+// WebView 的 console 外面看不到，关键路径写文件（~/Library/Application Support/dmde-rs/ui.log）
+function tlog(msg) {
+  try {
+    invoke("ui_log", { msg: String(msg) });
+  } catch (_) {}
+}
+
+let openingSource = false;
+
 async function openSource(path, partition = null) {
+  // 连点两下会起两个打开流程：一个在等授权窗、另一个已经成功，
+  // 状态栏就会卡在"正在打开"，界面也不再刷新。这里直接挡住重复进入。
+  if (openingSource) {
+    tlog(`open ignored (already opening): ${path}`);
+    return;
+  }
+  openingSource = true;
   const needsAdmin = path.startsWith("/dev/");
   setStatus(needsAdmin ? `正在打开 ${path}，若需要管理员权限会弹出系统授权窗…` : `正在打开 ${path} …`);
+  tlog(`open start ${path}`);
   try {
     const src = await invoke("open_source", { path, partition });
     state.source = src;
-    state.mode = "browse";
     renderPartitions();
     renderVolume(src);
+    tlog(`open ok fs=${src.fs_kind} label=${src.label}`);
     setStatus(`已挂载 ${src.desc} · ${src.fs_kind}`, "ok");
-    updateScanAvailability();
-    await updateAdmin();
+    // 不要 await：admin_state 要连一次 helper socket，慢的时候会把"列出目录"拖后几秒
+    updateAdmin();
     await navigate("/");
+    tlog("navigate / done");
   } catch (e) {
+    tlog(`open FAILED: ${e}`);
     setStatus(String(e), "error");
-    await updateAdmin();
+    updateAdmin();
+  } finally {
+    openingSource = false;
   }
 }
 
@@ -156,34 +176,11 @@ function renderVolume(src) {
 async function navigate(path) {
   state.path = path;
   state.selected = null;
-  // 从"扫描结果"点进任何目录，就回到普通浏览——否则会一直卡在已删除视图里
-  if (state.mode === "deleted") {
-    state.mode = "browse";
-    updateScanButton();
-  }
   renderCrumbs();
   await refresh();
 }
 
-/// 扫描按钮在两种状态间切换，给出明确的"回去"入口。
-/// 之前只能靠勾掉「显示已删除」才能退出扫描结果，等于没有出口。
-function updateScanButton() {
-  const b = $("btn-scan");
-  if (!b) return;
-  const inDeleted = state.mode === "deleted";
-  b.textContent = inDeleted ? "返回目录浏览" : "扫描可恢复文件";
-  b.classList.toggle("primary", inDeleted);
-  b.classList.toggle("ghost", !inDeleted);
-}
-
-function exitDeletedMode() {
-  state.mode = "browse";
-  updateScanButton();
-  navigate(state.path || "/");
-}
-
 async function refresh() {
-  if (state.mode === "deleted") return scanDeleted();
   const box = $("entries");
   box.innerHTML = `<p class="empty">读取中…</p>`;
   try {
@@ -192,8 +189,10 @@ async function refresh() {
       showDeleted: state.showDeleted,
     });
     state.entries = items;
+    tlog(`ls ${state.path} -> ${items.length} 项`);
     renderEntries(items);
   } catch (e) {
+    tlog(`ls FAIL ${state.path}: ${e}`);
     box.innerHTML = `<p class="empty" style="color:var(--danger)">${e}</p>`;
   }
 }
@@ -230,22 +229,8 @@ function renderEntries(items) {
   const box = $("entries");
   box.innerHTML = "";
 
-  // 扫描结果是"另一视图"，不是"目录"：进来先说明，并给出显眼的回去入口，
-  // 否则用户会以为目录丢了（实际只是被切换了视图）。
-  if (state.mode === "deleted") {
-    const bar = document.createElement("div");
-    bar.className = "notice";
-    bar.innerHTML = `<span>正在显示「已删除」扫描结果（共 ${items.length} 条，不含现存目录）</span>`;
-    const back = document.createElement("button");
-    back.className = "ghost";
-    back.textContent = "返回目录浏览";
-    back.onclick = exitDeletedMode;
-    bar.appendChild(back);
-    box.appendChild(bar);
-  }
-
   if (!items.length) {
-    box.innerHTML = `<p class="empty">${state.mode === "deleted" ? "没有扫描到可恢复文件" : "（空目录）"}</p>`;
+    box.innerHTML = `<p class="empty">（空目录）</p>`;
     updateStats();
     return;
   }
@@ -290,38 +275,6 @@ async function selectEntry(e, row) {
   }
 }
 
-async function scanDeleted() {
-  state.mode = "deleted";
-  updateScanButton();
-  const box = $("entries");
-  const kind = (state.source && state.source.fs_kind) || "";
-  const slow = kind === "APFS";
-  box.innerHTML = `<p class="empty">${
-    slow ? "APFS 要遍历整棵目录树（你这盘约 3500 万条记录），可能需要几分钟，请勿关闭窗口…"
-         : "正在扫描目录项，请稍候…"
-  }</p>`;
-  setStatus(slow ? "正在全树扫描（APFS），这一步比较慢…" : "正在扫描…");
-  try {
-    const items = await invoke("scan_deleted", { limit: 2000 });
-    state.entries = items;
-    renderEntries(items);
-    if (!items.length && slow) {
-      setStatus(
-        "没扫到可恢复的条目 —— 点「返回目录浏览」回到正常目录（扫描只列已删除文件，不列现存文件）",
-        "ok"
-      );
-    } else {
-      setStatus(`扫描完成：${items.length} 个可恢复文件（列表最多显示 2000 个）`, "ok");
-    }
-  } catch (e) {
-    // 出错时不要把人卡在错误页：直接退回浏览模式并重新列目录
-    state.mode = "browse";
-    updateScanButton();
-    setStatus(String(e), "error");
-    await refresh();
-  }
-}
-
 // ---------------- 动作 ----------------
 
 async function saveSelected() {
@@ -342,9 +295,10 @@ async function saveSelected() {
 }
 
 async function recoverAll() {
+  if (!state.source) { setStatus("先打开一个源", "error"); return; }
   const outDir = $("input-out").value.trim();
   if (!outDir) { setStatus("请先填写输出目录", "error"); return; }
-  setStatus("正在恢复…");
+  setStatus("正在恢复…（要先把已删除条目扫一遍，APFS 上比较慢）");
   try {
     const r = await invoke("recover_all", { outDir, minSize: 0, limit: 0 });
     setStatus(`恢复完成：成功 ${r.ok} 个，失败 ${r.failed} 个，共 ${r.bytes_human} → ${r.out_dir}`, "ok");
@@ -356,32 +310,6 @@ async function recoverAll() {
 // ---------------- 事件绑定 ----------------
 
 $("btn-refresh").onclick = loadDisks;
-
-// ---------------- 扫描入口 ----------------
-//
-// 浏览和导出**不需要**先扫描：直接进目录、勾文件就行。
-// 「扫描可恢复文件」只用来找"已删除但还能捞"的残留（按目录项反查），
-// 在 APFS 上要遍历整棵 fs-tree，这块盘约 3500 万条记录，要几分钟。
-// 所以照用户要求保留按钮，但把代价说清楚，别让人误以为不点它就没法选文件。
-
-function updateScanAvailability() {
-  const kind = (state.source && state.source.fs_kind) || "";
-  const noSource = !state.source;
-  ["btn-scan", "btn-recover"].forEach((id) => {
-    const el = $(id);
-    if (el) el.hidden = noSource;
-  });
-  const hint = $("scan-hint");
-  if (!hint) return;
-  if (kind === "APFS") {
-    hint.hidden = false;
-    hint.textContent =
-      "浏览和导出不用先扫描：直接进目录就能挑文件。上面的「扫描可恢复文件」是找已删除残留，APFS 上要遍历整棵目录树，约几分钟。";
-  } else {
-    hint.hidden = true;
-    hint.textContent = "";
-  }
-}
 
 // ---------------- 导出进度 ----------------
 // 后端每 120ms 最多发一帧，避免几万个小文件把 WebView 拖死
@@ -476,17 +404,12 @@ $("open-form").onsubmit = (ev) => {
 };
 $("chk-deleted").onchange = (ev) => {
   state.showDeleted = ev.target.checked;
-  if (state.mode === "deleted") { state.mode = "browse"; }
   refresh();
 };
 $("btn-up").onclick = () => {
   const parts = state.path.split("/").filter(Boolean);
   parts.pop();
   navigate("/" + parts.join("/"));
-};
-$("btn-scan").onclick = () => {
-  if (state.mode === "deleted") return exitDeletedMode();
-  return scanDeleted();
 };
 $("btn-save").onclick = saveSelected;
 $("btn-recover").onclick = recoverAll;
@@ -498,7 +421,14 @@ $("btn-recover").onclick = recoverAll;
   } catch (_) {
     $("input-out").value = "./dmde-rs-recovered";
   }
-  updateScanAvailability();
   await loadDisks();
   await updateAdmin();
+  // 调试入口：DMDE_OPEN_ON_START 指定的源自动打开（无鼠标自动化时用来复现问题）
+  try {
+    const bp = await invoke("boot_path");
+    if (bp) {
+      tlog(`boot auto-open ${bp}`);
+      await openSource(bp);
+    }
+  } catch (_) {}
 })();
