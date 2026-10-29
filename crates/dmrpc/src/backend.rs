@@ -1,7 +1,7 @@
 //! 统一后端：同一套调用在"本地进程读镜像"和"特权 helper 读设备"之间无感切换。
 
 use crate::client::Client;
-use crate::model::{EntryDto, PreviewDto, SourceDto};
+use crate::model::{DirSizeDto, EntryDto, PreviewDto, SourceDto};
 use crate::session::{OpenError, Session};
 use std::io::Write;
 
@@ -59,6 +59,14 @@ impl Backend {
         match self {
             Backend::Local(s) => s.read_id(id, out),
             Backend::Remote(c) => c.read_id(id, out),
+        }
+    }
+
+    /// 目录总大小（带时间预算）。
+    pub fn dir_size(&mut self, path: &str, budget_ms: u64) -> Result<DirSizeDto, String> {
+        match self {
+            Backend::Local(s) => s.dir_size(path, budget_ms),
+            Backend::Remote(c) => c.dir_size(path, budget_ms),
         }
     }
 

@@ -75,6 +75,7 @@ fn export_stops_immediately_when_already_paused() {
         "/sub",
         out.to_str().unwrap(),
         &cancel,
+        dmde_gui_lib::commands::Conflict::Skip,
         &mut |_, _| {},
     )
     .expect("暂停不是错误，应返回 Ok");
@@ -106,6 +107,7 @@ fn export_works_again_after_pause() {
             "/sub",
             out.to_str().unwrap(),
             &cancel,
+            dmde_gui_lib::commands::Conflict::Skip,
             &mut |_, _| {},
         )
         .unwrap();
@@ -121,6 +123,7 @@ fn export_works_again_after_pause() {
             "/sub",
             out.to_str().unwrap(),
             &cancel,
+            dmde_gui_lib::commands::Conflict::Skip,
             &mut |_, _| {},
         )
         .unwrap();
@@ -128,5 +131,121 @@ fn export_works_again_after_pause() {
     }
 
     assert!(out.join("sub/deeper/n.txt").exists(), "恢复后应写出完整目录");
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+
+// ---------------------------------------------------------------------------
+// 同名冲突：跳过 / 重命名 / 覆盖
+// ---------------------------------------------------------------------------
+
+use dmde_gui_lib::commands::Conflict;
+
+/// 导出一次 `/sub`，把里面的 n.txt 内容改成"用户后来改过的"，
+/// 模拟"这个目录之前已经导过、而且用户动过了"。
+fn prepare_existing(out: &std::path::Path) {
+    let (s, _) = dmrpc::open_local(image().unwrap(), None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+    dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/sub",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Overwrite,
+        &mut |_, _| {},
+    )
+    .expect("首次导出");
+    std::fs::write(out.join("sub/deeper/n.txt"), "user edited\n").unwrap();
+}
+
+#[test]
+fn skip_keeps_existing_files() {
+    let Some(_) = image() else { return };
+    let out = std::env::temp_dir().join(format!("dmde-skip-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    prepare_existing(&out);
+
+    let (s, _) = dmrpc::open_local(image().unwrap(), None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+    let msg = dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/sub",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Skip,
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    assert!(msg.contains("跳过"), "应报告跳过的数量，实际: {msg}");
+    assert_eq!(
+        std::fs::read_to_string(out.join("sub/deeper/n.txt")).unwrap(),
+        "user edited\n",
+        "跳过策略绝不能覆盖用户已有的文件"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn rename_creates_numbered_copy_and_keeps_original() {
+    let Some(_) = image() else { return };
+    let out = std::env::temp_dir().join(format!("dmde-rename-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    prepare_existing(&out);
+
+    let (s, _) = dmrpc::open_local(image().unwrap(), None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+    dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/sub",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Rename,
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    // 原文件保持用户改过的内容；新文件带序号且是源内容
+    assert_eq!(
+        std::fs::read_to_string(out.join("sub/deeper/n.txt")).unwrap(),
+        "user edited\n"
+    );
+    let renamed = out.join("sub/deeper/n (1).txt");
+    assert!(renamed.exists(), "应生成带序号的副本：{}", renamed.display());
+    assert_eq!(std::fs::read_to_string(&renamed).unwrap(), "nested\n");
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn overwrite_replaces_existing_content() {
+    let Some(_) = image() else { return };
+    let out = std::env::temp_dir().join(format!("dmde-over-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    prepare_existing(&out);
+
+    let (s, _) = dmrpc::open_local(image().unwrap(), None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+    dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/sub",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Overwrite,
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(out.join("sub/deeper/n.txt")).unwrap(),
+        "nested\n",
+        "覆盖策略应写回源内容"
+    );
+    assert!(
+        !out.join("sub/deeper/n (1).txt").exists(),
+        "覆盖不应产生副本"
+    );
+
     let _ = std::fs::remove_dir_all(&out);
 }

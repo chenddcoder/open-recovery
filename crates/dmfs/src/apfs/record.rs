@@ -370,6 +370,19 @@ pub fn ns_to_unix(ns: u64) -> Option<i64> {
 }
 
 /// xattr 名（与 drec 类似但只有一种格式：u16 长度 + 名字）
+/// 目录统计值：`j_dir_stats_val_t { u64 num_children; u64 total_size; u64 chained_key; }`
+///
+/// `num_children` 是**递归**的子项总数（文件 + 目录），`total_size` 是子树里
+/// 所有文件逻辑大小之和。APFS 增量维护这两个值，所以能 O(log n) 拿到目录总大小。
+pub fn parse_dir_stats(v: &[u8]) -> Option<(u64, u64)> {
+    if v.len() < 16 {
+        return None;
+    }
+    let children = u64::from_le_bytes(v[0..8].try_into().ok()?);
+    let size = u64::from_le_bytes(v[8..16].try_into().ok()?);
+    Some((children, size))
+}
+
 pub fn xattr_name(k: &[u8]) -> Option<String> {
     if k.len() < 10 {
         return None;

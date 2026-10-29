@@ -18,6 +18,8 @@ pub enum Request {
     Open { source: String, partition: Option<usize> },
     Ls { path: String, show_deleted: bool },
     Stat { path: String },
+    /// 统计目录总大小；`budget_ms` 是时间上限（超过就返回部分结果）
+    DirSize { path: String, budget_ms: u64 },
     Preview { path: String, max: usize },
     PreviewId { id: u64, max: usize },
     Deleted { limit: usize },
@@ -37,6 +39,7 @@ pub enum Reply {
     Source { source: SourceDto },
     Entries { entries: Vec<EntryDto> },
     Entry { entry: Option<EntryDto> },
+    DirSize { size: crate::model::DirSizeDto },
     Preview { preview: PreviewDto },
     /// 后跟 `len` 字节原始数据
     Chunk { len: u64 },

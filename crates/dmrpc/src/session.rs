@@ -8,7 +8,7 @@ use dmfs::{probe_partition, resolve, AnyFs, Entry, FileSystem, FsKind};
 use std::collections::HashMap;
 use std::io::Write;
 
-use crate::model::{EntryDto, PartDto, PreviewDto, SourceDto};
+use crate::model::{DirSizeDto, EntryDto, PartDto, PreviewDto, SourceDto};
 
 /// 打开失败。`permission` 为真表示"这台机器上需要更高权限"，GUI 据此弹授权窗。
 #[derive(Debug, Clone)]
@@ -56,6 +56,86 @@ impl Session {
         out.sort_by_key(|e| (!e.is_dir(), e.name.to_lowercase()));
         let base = if path.is_empty() { "/" } else { path };
         Ok(out.iter().map(|e| to_dto(base, e)).collect())
+    }
+
+    /// 统计目录总大小。
+    ///
+    /// 优先用文件系统自带的目录统计（APFS 若有 `dir_stats` 记录就是瞬时精确值）；
+    /// 没有就只能自己递归累加，并用 `budget_ms` 兜住时间：
+    /// 700 万文件的卷全量统计要几分钟，不能让一个"看一下多大"的按钮把界面拖死。
+    pub fn dir_size(&self, path: &str, budget_ms: u64) -> Result<DirSizeDto, String> {
+        let e = resolve(&self.fs, path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("路径不存在: {path}"))?;
+
+        if !e.is_dir() {
+            return Ok(DirSizeDto {
+                bytes: e.size,
+                bytes_human: dmdisk::human_size(e.size),
+                files: 1,
+                dirs: 0,
+                exact: true,
+                source: "file".into(),
+            });
+        }
+
+        // 快路径：文件系统自己维护的累计值
+        if let Some((children, bytes)) = self.fs.dir_stats(e.id) {
+            return Ok(DirSizeDto {
+                bytes,
+                bytes_human: dmdisk::human_size(bytes),
+                files: children,
+                dirs: 0,
+                exact: true,
+                source: "fs".into(),
+            });
+        }
+
+        // 慢路径：递归累加
+        let budget = budget_ms.clamp(200, 120_000);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(budget);
+        let mut stack = vec![e];
+        let (mut files, mut dirs, mut bytes) = (0u64, 0u64, 0u64);
+        let mut exact = true;
+
+        while let Some(d) = stack.pop() {
+            // 每处理一个目录检查一次时间：单个巨型目录（几十万条）也不会超时太多
+            if std::time::Instant::now() >= deadline {
+                exact = false;
+                break;
+            }
+            let entries = match self.fs.list(d.id) {
+                Ok(v) => v,
+                Err(_) => {
+                    // 某棵子树读不出来 → 结果不完整，必须诚实标记
+                    exact = false;
+                    continue;
+                }
+            };
+            for c in entries {
+                if c.is_dir() {
+                    dirs += 1;
+                    stack.push(c);
+                } else if c.kind == dmfs::NodeKind::File {
+                    // 符号链接不计（目标是别处的文件，重复算会虚高）
+                    files += 1;
+                    bytes = bytes.saturating_add(c.size);
+                }
+            }
+            if files + dirs > 2_000_000 {
+                exact = false;
+                break;
+            }
+        }
+
+        Ok(DirSizeDto {
+            bytes,
+            bytes_human: dmdisk::human_size(bytes),
+            files,
+            dirs,
+            exact,
+            source: "scan".into(),
+        })
     }
 
     /// 取单个条目的信息（判断是文件还是目录）。路径不存在返回 `Ok(None)`。

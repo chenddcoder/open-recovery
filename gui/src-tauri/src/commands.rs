@@ -122,16 +122,6 @@ pub async fn scan_deleted(
     }
 }
 
-fn unique_path(dir: &Path, name: &str) -> PathBuf {
-    let mut target = dir.join(name);
-    let mut n = 1;
-    while target.exists() {
-        target = dir.join(format!("{name}.{n}"));
-        n += 1;
-    }
-    target
-}
-
 /// 读一个条目并写到本地。写盘由 GUI 自己完成（非 root），属主、TCC、
 /// 目录权限都天然正确；helper 只负责把字节吐回来。
 fn dump_to_dir(
@@ -139,16 +129,21 @@ fn dump_to_dir(
     id: u64,
     name: &str,
     out_dir: &str,
-) -> Result<(PathBuf, u64), String> {
+    conflict: Conflict,
+) -> Result<Option<(PathBuf, u64)>, String> {
     fs::create_dir_all(out_dir).map_err(|e| format!("创建 {out_dir} 失败: {e}"))?;
-    let target = unique_path(Path::new(out_dir), &sanitize_name(name));
+    let wanted = Path::new(out_dir).join(sanitize_name(name));
+    let target = match resolve_conflict(&wanted, conflict) {
+        Some(p) => p,
+        None => return Ok(None), // 已存在且策略为跳过
+    };
     let file = fs::File::create(&target).map_err(|e| format!("创建 {} 失败: {e}", target.display()))?;
     let mut w = std::io::BufWriter::new(file);
     match b.read_id(id, &mut w) {
         Ok(n) if n > 0 => {
             use std::io::Write;
             w.flush().ok();
-            Ok((target, n))
+            Ok(Some((target, n)))
         }
         Ok(_) => {
             let _ = fs::remove_file(&target);
@@ -162,17 +157,51 @@ fn dump_to_dir(
     }
 }
 
+/// 统计目录总大小。
+///
+/// 带时间预算：给"这个目录多大、要不要导出"这个问题一个**有界**的答案，
+/// 而不是让界面无声地转几分钟。超过预算返回 `exact=false`，UI 会显示 `≥`。
+#[tauri::command]
+pub async fn dir_size(
+    state: tauri::State<'_, AppState>,
+    path: String,
+    budget_ms: Option<u64>,
+) -> Result<dmrpc::DirSizeDto, String> {
+    let mut backend = {
+        let mut g = state.backend.lock().map_err(|_| not_open())?;
+        g.take().ok_or_else(not_open)?
+    };
+    let budget = budget_ms.unwrap_or(8000);
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let r = backend.dir_size(&path, budget);
+        (backend, r)
+    })
+    .await;
+    match joined {
+        Ok((b, r)) => {
+            let mut g = state.backend.lock().map_err(|_| not_open())?;
+            *g = Some(b);
+            r
+        }
+        Err(e) => Err(format!("统计任务异常: {e}")),
+    }
+}
+
 #[tauri::command]
 pub fn save_file(
     state: tauri::State<AppState>,
     id: u64,
     name: String,
     out_dir: String,
+    on_conflict: Option<String>,
 ) -> Result<String, String> {
+    let conflict = Conflict::parse(on_conflict.as_deref());
     let mut guard = state.backend.lock().map_err(|_| not_open())?;
     let b = guard.as_mut().ok_or_else(not_open)?;
-    let (target, n) = dump_to_dir(b, id, &name, &out_dir)?;
-    Ok(format!("已保存 {}（{n} 字节）", target.display()))
+    match dump_to_dir(b, id, &name, &out_dir, conflict)? {
+        Some((target, n)) => Ok(format!("已保存 {}（{n} 字节）", target.display())),
+        None => Ok(format!("{name} 已存在于输出目录，按当前策略跳过")),
+    }
 }
 
 #[tauri::command]
@@ -195,13 +224,15 @@ pub fn recover_all(
     let mut bytes = 0u64;
     let mut saved = Vec::new();
     for e in &items {
-        match dump_to_dir(b, e.id, &e.name, &out_dir) {
-            Ok((p, n)) => {
+        // 批量恢复一律「改名保留两份」：这里的文件都是刚从盘里捞出来的，
+        // 覆盖掉输出目录里同名的旧结果风险太大
+        match dump_to_dir(b, e.id, &e.name, &out_dir, Conflict::Rename) {
+            Ok(Some((p, n))) => {
                 ok += 1;
                 bytes += n;
                 saved.push(p.display().to_string());
             }
-            Err(_) => failed += 1,
+            Ok(None) | Err(_) => failed += 1,
         }
     }
     Ok(RecoverDto {
@@ -287,11 +318,75 @@ pub fn current_source(state: tauri::State<AppState>) -> Result<String, String> {
 // 读字节始终由只读后端完成，写盘始终以用户身份进行，权限不混。
 // ---------------------------------------------------------------------------
 
+/// 目标位置已有同名文件时的处理方式。
+///
+/// 默认 **Skip**：恢复几 TB 的目录本来就慢，重复导出一遍再全量覆盖，
+/// 既浪费几个小时，也可能把上一轮已经确认无误的结果盖掉。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Conflict {
+    /// 已存在就跳过（不读源、不写盘，最快）
+    #[default]
+    Skip,
+    /// 保留已有文件，新文件改名为 `名字 (1).扩展名`
+    Rename,
+    /// 直接覆盖。注意：这是唯一会动到你已有文件的策略
+    Overwrite,
+}
+
+impl Conflict {
+    /// 前端传字符串；未知值一律按最安全的 Skip 处理，不做"猜"。
+    pub fn parse(s: Option<&str>) -> Self {
+        match s.unwrap_or("").trim().to_ascii_lowercase().as_str() {
+            "overwrite" => Conflict::Overwrite,
+            "rename" => Conflict::Rename,
+            _ => Conflict::Skip,
+        }
+    }
+}
+
+/// 给同名文件找一个新的兄弟名字：`a.txt` → `a (1).txt`。
+///
+/// 必须是 `名字 (n).扩展名`，不能是 `a.txt.1`：后者双击时系统不认识，
+/// 恢复出来的东西还得手动改回来。
+fn unique_sibling(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let ext = path.extension().map(|e| e.to_string_lossy().to_string());
+    for n in 1..=9999u32 {
+        let cand = match &ext {
+            Some(e) => parent.join(format!("{stem} ({n}).{e}")),
+            None => parent.join(format!("{stem} ({n})")),
+        };
+        if !cand.exists() {
+            return cand;
+        }
+    }
+    // 一万个同名文件还没找到空位就别再数了，加进程号保证不撞
+    parent.join(format!("{stem}-{}-{}", std::process::id(), ext.unwrap_or_default()))
+}
+
+/// 按策略决定这次实际写到哪里；`None` 表示「跳过」。
+fn resolve_conflict(dest: &Path, mode: Conflict) -> Option<PathBuf> {
+    if !dest.exists() {
+        return Some(dest.to_path_buf());
+    }
+    match mode {
+        Conflict::Skip => None,
+        Conflict::Overwrite => Some(dest.to_path_buf()),
+        Conflict::Rename => Some(unique_sibling(dest)),
+    }
+}
+
 #[derive(Default)]
 pub struct ExportStats {
     files: u64,
     dirs: u64,
     failed: u64,
+    /// 因为目标已存在而跳过的条目数（策略为 Skip 时）
+    skipped: u64,
     bytes: u64,
     /// 用户主动暂停时为 true（此时的计数是「暂停前已完成的部分」）
     cancelled: bool,
@@ -303,6 +398,7 @@ pub struct ExportProgress {
     pub files: u64,
     pub dirs: u64,
     pub failed: u64,
+    pub skipped: u64,
     pub bytes: u64,
     pub current: String,
     pub done: bool,
@@ -347,12 +443,22 @@ fn export_file(
     dest: &Path,
     st: &mut ExportStats,
     cancel: &AtomicBool,
+    conflict: Conflict,
     on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) {
     if cancel.load(Ordering::Relaxed) {
         st.cancelled = true;
         return;
     }
+    // 同名策略在这里生效：Skip 直接返回，连源都不读（几万个文件时快很多）
+    let actual = match resolve_conflict(dest, conflict) {
+        Some(p) => p,
+        None => {
+            st.skipped += 1;
+            return;
+        }
+    };
+    let dest = actual.as_path();
     if let Some(par) = dest.parent() {
         let _ = fs::create_dir_all(par);
     }
@@ -378,6 +484,13 @@ fn export_file(
         Ok(n) => {
             st.files += 1;
             st.bytes += n;
+            // 上一轮暂停留下的 .partial 已经过时了，留着只会让人分不清哪个是好的
+            let mut stale = dest.as_os_str().to_owned();
+            stale.push(".partial");
+            let stale = PathBuf::from(stale);
+            if stale.exists() {
+                let _ = fs::remove_file(&stale);
+            }
             on_progress(st, &entry.path);
         }
         // 被中断的文件不能冒充完整文件：改名 .partial，
@@ -399,6 +512,7 @@ fn export_dir(
     st: &mut ExportStats,
     depth: usize,
     cancel: &AtomicBool,
+    conflict: Conflict,
     on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) {
     // 防符号链接自指或异常深目录把栈打爆
@@ -410,6 +524,27 @@ fn export_dir(
         st.cancelled = true;
         return;
     }
+
+    // 目录已存在是正常的（增量导出、重复导出），直接复用；
+    // 但如果同名位置是个**文件**，就得按策略处理——
+    // 注意 Overwrite 也不删它：为了建目录而删掉你的文件，代价太大。
+    let actual = if dest.exists() && !dest.is_dir() {
+        match conflict {
+            Conflict::Skip => {
+                st.skipped += 1;
+                return;
+            }
+            Conflict::Rename => unique_sibling(dest),
+            Conflict::Overwrite => {
+                st.failed += 1;
+                return;
+            }
+        }
+    } else {
+        dest.to_path_buf()
+    };
+    let dest = actual.as_path();
+
     if fs::create_dir_all(dest).is_err() {
         st.failed += 1;
         return;
@@ -440,9 +575,9 @@ fn export_dir(
         }
         let p = dest.join(&name);
         if e.is_dir {
-            export_dir(b, &e.path, &p, st, depth + 1, cancel, on_progress);
+            export_dir(b, &e.path, &p, st, depth + 1, cancel, conflict, on_progress);
         } else {
-            export_file(b, &e, &p, st, cancel, on_progress);
+            export_file(b, &e, &p, st, cancel, conflict, on_progress);
         }
         if st.cancelled {
             return;
@@ -467,7 +602,9 @@ pub async fn export_path(
     state: tauri::State<'_, AppState>,
     path: String,
     out_dir: String,
+    on_conflict: Option<String>,
 ) -> Result<String, String> {
+    let conflict = Conflict::parse(on_conflict.as_deref());
     // 把后端独占取出：既避免跨线程借用，也保证导出期间不会被别的命令插队
     let backend = {
         let mut g = state.backend.lock().map_err(|_| not_open())?;
@@ -482,7 +619,7 @@ pub async fn export_path(
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let mut b = backend;
         let mut last = std::time::Instant::now();
-        let res = do_export_with(&mut b, &path, &out_dir, &flag, &mut |st, cur| {
+        let res = do_export_with(&mut b, &path, &out_dir, &flag, conflict, &mut |st, cur| {
             // 节流：导出几万个小文件时，每个都发事件会把 WebView 拖死
             if last.elapsed().as_millis() >= 120 {
                 last = std::time::Instant::now();
@@ -493,6 +630,7 @@ pub async fn export_path(
                         files: st.files,
                         dirs: st.dirs,
                         failed: st.failed,
+                        skipped: st.skipped,
                         bytes: st.bytes,
                         current: cur.to_string(),
                         done: false,
@@ -528,9 +666,16 @@ pub async fn export_path(
     }
 }
 
-/// 导出核心（与 Tauri 解耦，便于直接测试）。
+/// 导出核心（与 Tauri 解耦，便于直接测试）。默认冲突策略：跳过已存在。
 pub fn do_export(b: &mut Backend, path: &str, out_dir: &str) -> Result<String, String> {
-    do_export_with(b, path, out_dir, &AtomicBool::new(false), &mut |_, _| {})
+    do_export_with(
+        b,
+        path,
+        out_dir,
+        &AtomicBool::new(false),
+        Conflict::default(),
+        &mut |_, _| {},
+    )
 }
 
 pub fn do_export_with(
@@ -538,6 +683,7 @@ pub fn do_export_with(
     path: &str,
     out_dir: &str,
     cancel: &AtomicBool,
+    conflict: Conflict,
     on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) -> Result<String, String> {
     let root = PathBuf::from(out_dir);
@@ -571,32 +717,34 @@ pub fn do_export_with(
             }
             let p = dest.join(&n);
             if e.is_dir {
-                export_dir(b, &e.path, &p, &mut st, 1, cancel, on_progress);
+                export_dir(b, &e.path, &p, &mut st, 1, cancel, conflict, on_progress);
             } else {
-                export_file(b, &e, &p, &mut st, cancel, on_progress);
+                export_file(b, &e, &p, &mut st, cancel, conflict, on_progress);
             }
             if st.cancelled {
                 break;
             }
         }
     } else {
-        export_file(b, &entry, &dest, &mut st, cancel, on_progress);
+        export_file(b, &entry, &dest, &mut st, cancel, conflict, on_progress);
     }
 
-    let tail = if st.cancelled {
-        "；已按你的要求暂停（未写完的文件改名为 .partial）"
-    } else {
-        ""
-    };
+    let mut extra = String::new();
+    if st.skipped > 0 {
+        extra.push_str(&format!("、跳过 {} 个（目标已存在）", st.skipped));
+    }
+    if st.cancelled {
+        extra.push_str("；已按你的要求暂停（未写完的文件改名为 .partial）");
+    }
     Ok(format!(
-        "{} {}：{} 个文件、{} 个目录、{} 个失败，共 {}{}",
+        "{} {}：{} 个文件、{} 个目录、{} 个失败{}，共 {}",
         if st.cancelled { "已暂停导出到" } else { "已导出到" },
         dest.display(),
         st.files,
         st.dirs,
         st.failed,
-        dmdisk::human_size(st.bytes),
-        tail
+        extra,
+        dmdisk::human_size(st.bytes)
     ))
 }
 
@@ -651,5 +799,53 @@ mod tests {
     #[test]
     fn export_stats_default_is_not_cancelled() {
         assert!(!ExportStats::default().cancelled);
+    }
+
+    /// 未知的策略字符串必须退回最安全的「跳过」，绝不能猜成覆盖。
+    #[test]
+    fn conflict_parse_falls_back_to_skip() {
+        use super::Conflict;
+        assert_eq!(Conflict::parse(None), Conflict::Skip);
+        assert_eq!(Conflict::parse(Some("")), Conflict::Skip);
+        assert_eq!(Conflict::parse(Some("随便什么")), Conflict::Skip);
+        assert_eq!(Conflict::parse(Some("overwrite")), Conflict::Overwrite);
+        assert_eq!(Conflict::parse(Some("RENAME")), Conflict::Rename);
+        assert_eq!(Conflict::parse(Some(" rename ")), Conflict::Rename);
+    }
+
+    /// 重命名要保住扩展名（`a.txt` → `a (1).txt`），
+    /// 否则恢复出来的文件双击打不开，还得手动改回来。
+    #[test]
+    fn unique_sibling_keeps_extension() {
+        use super::unique_sibling;
+        let dir = std::env::temp_dir().join(format!("dmde-uniq-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let a = dir.join("a.txt");
+        std::fs::write(&a, b"x").unwrap();
+        let n1 = unique_sibling(&a);
+        assert_eq!(n1.file_name().unwrap().to_string_lossy(), "a (1).txt");
+        std::fs::write(&n1, b"y").unwrap();
+        let n2 = unique_sibling(&a);
+        assert_eq!(n2.file_name().unwrap().to_string_lossy(), "a (2).txt");
+
+        // 无扩展名
+        let b = dir.join("noext");
+        std::fs::write(&b, b"z").unwrap();
+        assert_eq!(
+            unique_sibling(&b).file_name().unwrap().to_string_lossy(),
+            "noext (1)"
+        );
+
+        // 隐藏文件不能被当成"扩展名为 gitconfig"
+        let h = dir.join(".gitconfig");
+        std::fs::write(&h, b"z").unwrap();
+        assert_eq!(
+            unique_sibling(&h).file_name().unwrap().to_string_lossy(),
+            ".gitconfig (1)"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

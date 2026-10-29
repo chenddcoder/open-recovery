@@ -95,7 +95,7 @@ sidebar, .sidebar { border-right: 1px solid var(--border); overflow-y: auto; pad
 .hint { margin: 6px 0 0; font-size: 10.5px; color: var(--text-dim); line-height: 1.45; }
 .hint code { font-family: var(--mono); color: var(--warn); }
 
-input[type="text"] {
+input[type="text"], select {
   background: var(--bg-input);
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -105,7 +105,8 @@ input[type="text"] {
   font-family: var(--mono);
   outline: none;
 }
-input[type="text"]:focus { border-color: var(--accent-dim); }
+input[type="text"]:focus, select:focus { border-color: var(--accent-dim); }
+select { padding: 5px 6px; }
 
 button {
   background: var(--bg-input);
@@ -226,3 +227,14 @@ button.danger:hover:not(:disabled) {
   border-color: var(--danger);
   background: #2a1616;
 }
+
+/* 目录大小：数字要能一眼看懂，按钮不要抢视线 */
+.size-row { display: flex; align-items: center; gap: 8px; }
+.size-row .size-text {
+  flex: 1;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  color: var(--text);
+  word-break: break-all;
+}
+.size-row button { padding: 3px 8px; font-size: 11px; flex: none; }

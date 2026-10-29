@@ -1,6 +1,6 @@
 //! helper 客户端。所有调用都返回人类可读的中文错误，方便直接展示到状态栏。
 
-use crate::model::{DiskDto, EntryDto, PreviewDto, SourceDto};
+use crate::model::{DirSizeDto, DiskDto, EntryDto, PreviewDto, SourceDto};
 use crate::proto::{self, Reply, Request};
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -79,6 +79,15 @@ impl Client {
     pub fn preview_id(&mut self, id: u64, max: usize) -> Result<PreviewDto, String> {
         match self.call(&Request::PreviewId { id, max }) {
             Ok(Reply::Preview { preview }) => Ok(preview),
+            Ok(Reply::Error { message }) => Err(message),
+            Ok(other) => Err(unexpected(&other).to_string()),
+            Err(e) => Err(format!("连接 helper 失败: {e}")),
+        }
+    }
+
+    pub fn dir_size(&mut self, path: &str, budget_ms: u64) -> Result<DirSizeDto, String> {
+        match self.call(&Request::DirSize { path: path.to_string(), budget_ms }) {
+            Ok(Reply::DirSize { size }) => Ok(size),
             Ok(Reply::Error { message }) => Err(message),
             Ok(other) => Err(unexpected(&other).to_string()),
             Err(e) => Err(format!("连接 helper 失败: {e}")),

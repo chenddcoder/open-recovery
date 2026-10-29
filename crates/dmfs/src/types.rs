@@ -171,6 +171,15 @@ pub trait FileSystem {
     fn supports_deleted(&self) -> bool {
         true
     }
+
+    /// 目录的聚合统计 `(子项数, 总字节数)`。
+    ///
+    /// 只有自己维护统计的文件系统才返回 `Some`（APFS 有 `j_dir_stats_val_t`）。
+    /// 返回 `None` 时调用方需要自己递归遍历——在几百万文件的卷上那是分钟级操作，
+    /// 所以「有没有这个接口」直接决定了能不能"秒看目录大小"。
+    fn dir_stats(&self, _dir: NodeId) -> Option<(u64, u64)> {
+        None
+    }
 }
 
 /// 按路径逐级解析，例如 `/Users/a.txt` 或 `a/b/c`。

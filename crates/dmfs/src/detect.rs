@@ -157,6 +157,14 @@ impl AnyFs {
         }
     }
 
+    /// 诊断用：APFS 卷的记录类型直方图；非 APFS 返回 `None`。
+    pub fn type_histogram(&self) -> Option<Result<Vec<(u8, u64)>>> {
+        match self {
+            AnyFs::Apfs(f) => Some(f.type_histogram()),
+            _ => None,
+        }
+    }
+
     /// 打开指定卷（只有 APFS 容器有多卷概念，其它文件系统忽略 `index`）。
     pub fn open_volume(reader: Reader, index: usize) -> Result<Self> {
         if probe(&reader) == FsKind::Apfs {
@@ -202,5 +210,8 @@ impl FileSystem for AnyFs {
     }
     fn supports_deleted(&self) -> bool {
         self.as_dyn().supports_deleted()
+    }
+    fn dir_stats(&self, dir: NodeId) -> Option<(u64, u64)> {
+        self.as_dyn().dir_stats(dir)
     }
 }

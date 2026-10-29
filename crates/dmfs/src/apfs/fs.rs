@@ -236,6 +236,36 @@ impl Apfs {
         Ok(ino)
     }
 
+    /// 目录聚合大小 `(子项数, 总字节数)`，来自 APFS 自带的 dir stats 记录。
+    ///
+    /// 这是文件系统**增量维护**的累计值，不需要遍历子树：
+    /// 在 700 万文件的卷上递归统计要几分钟，这个点查是 O(log n)。
+    pub fn dir_stats(&self, id: u64) -> Option<(u64, u64)> {
+        let key = record::make_key(id, record::T_DIR_STATS);
+        let v = self
+            .tree()
+            .lookup(self.root_paddr, &mut self.resolver(), &key)
+            .ok()??;
+        record::parse_dir_stats(&v)
+    }
+
+    /// 诊断：统计 fs-tree 里每种记录的数量（**一次全树扫描**，几千万条时很慢）。
+    ///
+    /// 用来回答"这个卷到底有没有 dir stats / 快照记录"这类问题：
+    /// 有记录而查不到，是键写错了；压根没有记录，就只能自己遍历。
+    pub fn type_histogram(&self) -> Result<Vec<(u8, u64)>> {
+        let mut counts: std::collections::BTreeMap<u8, u64> = std::collections::BTreeMap::new();
+        let start = record::make_key(0, 0);
+        let tree = self.tree();
+        let mut res = self.resolver();
+        tree.scan(self.root_paddr, &mut res, &start, &mut |k, _v| {
+            let kind = record::key_kind(k);
+            *counts.entry(kind).or_insert(0) += 1;
+            true
+        })?;
+        Ok(counts.into_iter().collect())
+    }
+
     /// 目录下的原始记录 `(名字, drec)`。
     fn dir_records(&self, dir: u64) -> Result<Vec<(String, record::Drec)>> {
         let start = record::make_key(dir, record::T_DIR_REC);
@@ -474,6 +504,10 @@ impl FileSystem for Apfs {
 
     /// 有 inode 但没有目录项指向它（孤儿）——APFS 上真删除通常连 inode 一起回收，
     /// 所以返回空是常态。展开说明见 [`super::recover`]。
+    fn dir_stats(&self, dir: NodeId) -> Option<(u64, u64)> {
+        Apfs::dir_stats(self, dir.0)
+    }
+
     fn deleted(&self) -> Result<Vec<Entry>> {
         super::recover::orphan_scan(self)
     }

@@ -156,7 +156,66 @@ async function navigate(path) {
   state.path = path;
   state.selected = null;
   renderCrumbs();
+  resetDirSize();
   await refresh();
+}
+
+// ---------------- 目录大小 ----------------
+
+function resetDirSize() {
+  const el = $("dir-size");
+  if (!el) return;
+  el.textContent = "未统计";
+  el.style.color = "";
+  const b = $("btn-dirsize");
+  if (b) {
+    b.disabled = false;
+    b.textContent = "计算大小";
+  }
+}
+
+// 时间预算是故意的：700 万文件的卷要全量统计得几分钟，
+// 与其让人盯着转圈，不如 8 秒给个"至少这么大"的下界。
+const DIR_SIZE_BUDGET_MS = 8000;
+
+async function computeDirSize() {
+  if (!state.source) {
+    setStatus("先打开一个源", "error");
+    return;
+  }
+  const el = $("dir-size");
+  const b = $("btn-dirsize");
+  b.disabled = true;
+  b.textContent = "统计中…";
+  el.textContent = `统计中（最多 ${DIR_SIZE_BUDGET_MS / 1000} 秒）…`;
+  try {
+    const r = await invoke("dir_size", {
+      path: state.path || "/",
+      budgetMs: DIR_SIZE_BUDGET_MS,
+    });
+    el.textContent = describeDirSize(r);
+    el.style.color = r.exact ? "" : "var(--warn)";
+  } catch (e) {
+    el.textContent = String(e);
+    el.style.color = "var(--danger)";
+  } finally {
+    b.disabled = false;
+    b.textContent = "重新计算";
+  }
+}
+
+function describeDirSize(r) {
+  if (r.source === "file") return `${r.bytes_human}（单个文件）`;
+  const items = r.files + r.dirs;
+  const n = items.toLocaleString("zh-CN");
+  if (r.source === "fs") {
+    return `${r.bytes_human} · ${n} 项（文件系统自带统计）`;
+  }
+  if (r.exact) {
+    return `${r.bytes_human} · ${r.files.toLocaleString("zh-CN")} 个文件 / ${r.dirs.toLocaleString("zh-CN")} 个目录`;
+  }
+  // 没算完：给下界，不给假精确值
+  return `≥ ${r.bytes_human}（${DIR_SIZE_BUDGET_MS / 1000} 秒内统计了 ${n} 项，未完成，实际更大）`;
 }
 
 async function refresh() {
@@ -285,10 +344,12 @@ async function saveSelected() {
   if (!state.selected || state.selected.is_dir) return;
   const outDir = $("input-out").value.trim();
   try {
+    const sel = $("sel-conflict");
     const msg = await invoke("save_file", {
       id: state.selected.id,
       name: state.selected.name,
       outDir,
+      onConflict: sel ? sel.value : "skip",
     });
     setStatus(msg, "ok");
   } catch (e) {
@@ -329,6 +390,7 @@ async function ensureExportListener() {
     }
     box.hidden = false;
     const parts = [`${p.files} 个文件`, `${p.dirs} 个目录`, fmtSize(p.bytes || 0)];
+    if (p.skipped) parts.push(`跳过 ${p.skipped}`);
     if (p.failed) parts.push(`失败 ${p.failed}`);
     $("export-progress-text").textContent = `${parts.join(" · ")}\n${p.current || ""}`;
   });
@@ -360,12 +422,15 @@ $("btn-export").onclick = async () => {
     setStatus("请先填写输出目录", "error");
     return;
   }
+  const sel = $("sel-conflict");
+  const onConflict = sel ? sel.value : "skip";
   const p = state.path || "/";
   setStatus(`正在导出 ${p} …`);
   const btn = $("btn-export");
   const up = $("btn-up");
   const stop = $("btn-cancel-export");
   btn.disabled = true;
+  if (sel) sel.disabled = true;
   if (up) up.disabled = true;
   stop.hidden = false;
   stop.disabled = false;
@@ -375,7 +440,7 @@ $("btn-export").onclick = async () => {
   box.hidden = false;
   $("export-progress-text").textContent = "正在准备…";
   try {
-    const msg = await invoke("export_path", { path: p, outDir });
+    const msg = await invoke("export_path", { path: p, outDir, onConflict });
     // 后端会在消息里写明是"已暂停"还是"已导出"，直接透出
     setStatus(msg, msg.startsWith("已暂停") ? "" : "ok");
   } catch (e) {
@@ -385,8 +450,13 @@ $("btn-export").onclick = async () => {
     box.hidden = true;
     btn.disabled = false;
     if (up) up.disabled = false;
+    if (sel) sel.disabled = false;
     stop.hidden = true;
   }
+};
+// 覆盖是唯一会动到已有文件的策略，选中时把警告显出来
+$("sel-conflict").onchange = (ev) => {
+  $("conflict-hint").hidden = ev.target.value !== "overwrite";
 };
 $("btn-admin").onclick = requestAdmin;
 $("open-form").onsubmit = (ev) => {
@@ -407,6 +477,7 @@ $("btn-up").onclick = () => {
 $("btn-scan").onclick = scanDeleted;
 $("btn-save").onclick = saveSelected;
 $("btn-recover").onclick = recoverAll;
+$("btn-dirsize").onclick = computeDirSize;
 
 (async () => {
   try {
