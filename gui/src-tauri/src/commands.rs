@@ -15,6 +15,25 @@ fn not_open() -> String {
     "还没有打开任何卷".to_string()
 }
 
+/// 列出本机物理磁盘（`diskutil` 查询，不需要 root，也不会碰设备）。
+#[tauri::command]
+pub fn list_disks() -> Result<Vec<dmrpc::DiskDto>, String> {
+    let disks = dmdisk::list_disks().map_err(|e| e.to_string())?;
+    Ok(disks
+        .into_iter()
+        .map(|d| dmrpc::DiskDto {
+            dev_node: d.dev_node,
+            bsd: d.bsd,
+            size: d.size,
+            size_human: dmdisk::human_size(d.size),
+            model: d.model,
+            bus: d.bus,
+            internal: d.internal,
+            removable: d.removable,
+        })
+        .collect())
+}
+
 /// 有权限就直接开；只有"权限不足"才值得弹授权窗——其它错误（路径不存在、
 /// 格式不认识）弹密码窗纯属骚扰用户。
 #[tauri::command]
