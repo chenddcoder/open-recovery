@@ -17,6 +17,22 @@ fn not_open() -> String {
     "还没有打开任何卷".to_string()
 }
 
+/// backend 被长任务取走时给出的说明（比"还没有打开任何卷"诚实）。
+fn busy_note(state: &AppState) -> Option<String> {
+    state
+        .busy
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .map(|t| format!("正在{t}，请稍候（界面会在这期间暂时列不出目录）"))
+}
+
+fn set_busy(state: &AppState, what: Option<&str>) {
+    if let Ok(mut g) = state.busy.lock() {
+        *g = what.map(|s| s.to_string());
+    }
+}
+
 /// 列出本机物理磁盘（`diskutil` 查询，不需要 root，也不会碰设备）。
 #[tauri::command]
 pub fn list_disks() -> Result<Vec<dmrpc::DiskDto>, String> {
@@ -77,7 +93,10 @@ pub fn list_dir(
     show_deleted: bool,
 ) -> Result<Vec<EntryDto>, String> {
     let mut guard = state.backend.lock().map_err(|_| not_open())?;
-    let b = guard.as_mut().ok_or_else(not_open)?;
+    let b = match guard.as_mut() {
+        Some(b) => b,
+        None => return Err(busy_note(&state).unwrap_or_else(not_open)),
+    };
     b.list_dir(&path, show_deleted)
 }
 
@@ -107,11 +126,13 @@ pub async fn scan_deleted(
         let mut g = state.backend.lock().map_err(|_| not_open())?;
         g.take().ok_or_else(not_open)?
     };
+    set_busy(&state, Some("扫描可恢复文件"));
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let r = backend.deleted(limit.unwrap_or(0));
         (backend, r)
     })
     .await;
+    set_busy(&state, None);
     match joined {
         Ok((b, r)) => {
             let mut g = state.backend.lock().map_err(|_| not_open())?;
@@ -583,6 +604,7 @@ pub async fn export_path(
 
     // 清掉上一轮可能残留的暂停标志，否则这次一开始就会立刻"暂停"
     state.export_cancel.store(false, Ordering::SeqCst);
+    set_busy(&state, Some("导出文件"));
     let flag = state.export_cancel.clone();
 
     let handle = app.clone();
@@ -614,6 +636,7 @@ pub async fn export_path(
     })
     .await;
 
+    set_busy(&state, None);
     match joined {
         Ok((b, res, cancelled)) => {
             let mut g = state.backend.lock().map_err(|_| not_open())?;

@@ -70,6 +70,7 @@ async function openSource(path, partition = null) {
     renderPartitions();
     renderVolume(src);
     setStatus(`已挂载 ${src.desc} · ${src.fs_kind}`, "ok");
+    updateScanAvailability();
     await updateAdmin();
     await navigate("/");
   } catch (e) {
@@ -155,8 +156,30 @@ function renderVolume(src) {
 async function navigate(path) {
   state.path = path;
   state.selected = null;
+  // 从"扫描结果"点进任何目录，就回到普通浏览——否则会一直卡在已删除视图里
+  if (state.mode === "deleted") {
+    state.mode = "browse";
+    updateScanButton();
+  }
   renderCrumbs();
   await refresh();
+}
+
+/// 扫描按钮在两种状态间切换，给出明确的"回去"入口。
+/// 之前只能靠勾掉「显示已删除」才能退出扫描结果，等于没有出口。
+function updateScanButton() {
+  const b = $("btn-scan");
+  if (!b) return;
+  const inDeleted = state.mode === "deleted";
+  b.textContent = inDeleted ? "返回目录浏览" : "扫描可恢复文件";
+  b.classList.toggle("primary", inDeleted);
+  b.classList.toggle("ghost", !inDeleted);
+}
+
+function exitDeletedMode() {
+  state.mode = "browse";
+  updateScanButton();
+  navigate(state.path || "/");
 }
 
 async function refresh() {
@@ -206,6 +229,21 @@ function iconFor(e) {
 function renderEntries(items) {
   const box = $("entries");
   box.innerHTML = "";
+
+  // 扫描结果是"另一视图"，不是"目录"：进来先说明，并给出显眼的回去入口，
+  // 否则用户会以为目录丢了（实际只是被切换了视图）。
+  if (state.mode === "deleted") {
+    const bar = document.createElement("div");
+    bar.className = "notice";
+    bar.innerHTML = `<span>正在显示「已删除」扫描结果（共 ${items.length} 条，不含现存目录）</span>`;
+    const back = document.createElement("button");
+    back.className = "ghost";
+    back.textContent = "返回目录浏览";
+    back.onclick = exitDeletedMode;
+    bar.appendChild(back);
+    box.appendChild(bar);
+  }
+
   if (!items.length) {
     box.innerHTML = `<p class="empty">${state.mode === "deleted" ? "没有扫描到可恢复文件" : "（空目录）"}</p>`;
     updateStats();
@@ -254,6 +292,7 @@ async function selectEntry(e, row) {
 
 async function scanDeleted() {
   state.mode = "deleted";
+  updateScanButton();
   const box = $("entries");
   const kind = (state.source && state.source.fs_kind) || "";
   const slow = kind === "APFS";
@@ -267,13 +306,17 @@ async function scanDeleted() {
     state.entries = items;
     renderEntries(items);
     if (!items.length && slow) {
-      setStatus("没扫到孤儿 inode —— APFS 真删除会连 inode 一起回收，属正常；可先看 .Trashes 或快照", "ok");
+      setStatus(
+        "没扫到可恢复的条目 —— 点「返回目录浏览」回到正常目录（扫描只列已删除文件，不列现存文件）",
+        "ok"
+      );
     } else {
       setStatus(`扫描完成：${items.length} 个可恢复文件（列表最多显示 2000 个）`, "ok");
     }
   } catch (e) {
     // 出错时不要把人卡在错误页：直接退回浏览模式并重新列目录
     state.mode = "browse";
+    updateScanButton();
     setStatus(String(e), "error");
     await refresh();
   }
@@ -313,6 +356,32 @@ async function recoverAll() {
 // ---------------- 事件绑定 ----------------
 
 $("btn-refresh").onclick = loadDisks;
+
+// ---------------- 扫描入口 ----------------
+//
+// 浏览和导出**不需要**先扫描：直接进目录、勾文件就行。
+// 「扫描可恢复文件」只用来找"已删除但还能捞"的残留（按目录项反查），
+// 在 APFS 上要遍历整棵 fs-tree，这块盘约 3500 万条记录，要几分钟。
+// 所以照用户要求保留按钮，但把代价说清楚，别让人误以为不点它就没法选文件。
+
+function updateScanAvailability() {
+  const kind = (state.source && state.source.fs_kind) || "";
+  const noSource = !state.source;
+  ["btn-scan", "btn-recover"].forEach((id) => {
+    const el = $(id);
+    if (el) el.hidden = noSource;
+  });
+  const hint = $("scan-hint");
+  if (!hint) return;
+  if (kind === "APFS") {
+    hint.hidden = false;
+    hint.textContent =
+      "浏览和导出不用先扫描：直接进目录就能挑文件。上面的「扫描可恢复文件」是找已删除残留，APFS 上要遍历整棵目录树，约几分钟。";
+  } else {
+    hint.hidden = true;
+    hint.textContent = "";
+  }
+}
 
 // ---------------- 导出进度 ----------------
 // 后端每 120ms 最多发一帧，避免几万个小文件把 WebView 拖死
@@ -415,7 +484,10 @@ $("btn-up").onclick = () => {
   parts.pop();
   navigate("/" + parts.join("/"));
 };
-$("btn-scan").onclick = scanDeleted;
+$("btn-scan").onclick = () => {
+  if (state.mode === "deleted") return exitDeletedMode();
+  return scanDeleted();
+};
 $("btn-save").onclick = saveSelected;
 $("btn-recover").onclick = recoverAll;
 
@@ -426,6 +498,7 @@ $("btn-recover").onclick = recoverAll;
   } catch (_) {
     $("input-out").value = "./dmde-rs-recovered";
   }
+  updateScanAvailability();
   await loadDisks();
   await updateAdmin();
 })();

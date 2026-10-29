@@ -24,6 +24,11 @@ pub struct AppState {
     /// 暂停命令若去抢 `backend` 那把锁，就会一直等到导出结束——
     /// 表现正是"点了暂停没反应"。
     pub export_cancel: Arc<AtomicBool>,
+    /// 正在进行的长时间任务（扫描/导出）。
+    ///
+    /// 这类任务会把 `backend` 整个取走独占，此时任何列目录都会失败；
+    /// 有了这个标记，界面能显示「正在扫描，请稍候」而不是误导人的「还没有打开任何卷」。
+    pub busy: Mutex<Option<String>>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
