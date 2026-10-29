@@ -37,25 +37,35 @@ pub fn list_disks() -> Result<Vec<dmrpc::DiskDto>, String> {
 /// 有权限就直接开；只有"权限不足"才值得弹授权窗——其它错误（路径不存在、
 /// 格式不认识）弹密码窗纯属骚扰用户。
 #[tauri::command]
-pub fn open_source(
-    state: tauri::State<AppState>,
+pub async fn open_source(
+    state: tauri::State<'_, AppState>,
     path: String,
     partition: Option<usize>,
 ) -> Result<SourceDto, String> {
+    // 这里最长要等系统授权窗 180 秒，再读几 MB 分区元数据。
+    // 同步命令跑在 Tauri 主线程上，一旦阻塞窗口连重绘都做不到，
+    // 用户看到的就是"点完授权，整个应用卡死"。
+    let p = path.clone();
+    let opened = tauri::async_runtime::spawn_blocking(
+        move || -> Result<(Backend, SourceDto), String> {
+            match open_local(&p, partition) {
+                Ok((s, dto)) => Ok((Backend::Local(s), dto)),
+                Err(e) if e.permission => {
+                    let mut client = priv_helper::connect()?;
+                    let dto = client.open(&p, partition)?;
+                    Ok((Backend::Remote(client), dto))
+                }
+                Err(e) => Err(e.message),
+            }
+        },
+    )
+    .await
+    .map_err(|e| format!("打开任务异常: {e}"))?;
+
+    let (backend, dto) = opened?;
     let mut guard = state.backend.lock().map_err(|_| not_open())?;
-    match open_local(&path, partition) {
-        Ok((s, dto)) => {
-            *guard = Some(Backend::Local(s));
-            Ok(dto)
-        }
-        Err(e) if e.permission => {
-            let mut client = priv_helper::connect()?;
-            let dto = client.open(&path, partition)?;
-            *guard = Some(Backend::Remote(client));
-            Ok(dto)
-        }
-        Err(e) => Err(e.message),
-    }
+    *guard = Some(backend);
+    Ok(dto)
 }
 
 #[tauri::command]
@@ -205,38 +215,46 @@ pub struct AdminState {
 }
 
 #[tauri::command]
-pub fn admin_state(state: tauri::State<AppState>) -> AdminState {
+pub async fn admin_state(state: tauri::State<'_, AppState>) -> Result<AdminState, String> {
     let backend = state
         .backend
         .lock()
         .ok()
         .and_then(|g| g.as_ref().map(|b| b.kind().to_string()))
         .unwrap_or_else(|| "none".into());
-    AdminState {
+    // alive() 会真的去连一次 socket，可能阻塞几秒 —— 放到后台线程
+    let helper = tauri::async_runtime::spawn_blocking(priv_helper::alive)
+        .await
+        .unwrap_or(false);
+    Ok(AdminState {
         active: backend == "admin",
-        helper: priv_helper::alive(),
+        helper,
         backend,
-    }
+    })
 }
 
 /// 主动请求管理员权限（会弹出 macOS 标准授权窗）。
 #[tauri::command]
-pub fn request_admin() -> Result<String, String> {
-    let mut c = priv_helper::connect()?;
-    c.ping()?;
-    Ok("已获得管理员权限（只读）".to_string())
+pub async fn request_admin() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let mut c = priv_helper::connect()?;
+        c.ping()?;
+        Ok("已获得管理员权限（只读）".to_string())
+    })
+    .await
+    .map_err(|e| format!("提权任务异常: {e}"))?
 }
 
 /// 放弃管理员权限：helper 收到 shutdown 后自行退出。
 #[tauri::command]
-pub fn drop_admin(state: tauri::State<AppState>) -> Result<String, String> {
+pub async fn drop_admin(state: tauri::State<'_, AppState>) -> Result<String, String> {
     {
         let mut guard = state.backend.lock().map_err(|_| not_open())?;
         if matches!(guard.as_ref(), Some(Backend::Remote(_))) {
             *guard = None;
         }
     }
-    priv_helper::shutdown();
+    let _ = tauri::async_runtime::spawn_blocking(priv_helper::shutdown).await;
     Ok("已退出提权模式".into())
 }
 
@@ -253,11 +271,22 @@ pub fn current_source(state: tauri::State<AppState>) -> Result<String, String> {
 // ---------------------------------------------------------------------------
 
 #[derive(Default)]
-struct ExportStats {
+pub struct ExportStats {
     files: u64,
     dirs: u64,
     failed: u64,
     bytes: u64,
+}
+
+/// 导出进度事件（每 ~120ms 最多一帧，避免刷屏拖慢导出本身）。
+#[derive(Default, Clone, serde::Serialize)]
+pub struct ExportProgress {
+    pub files: u64,
+    pub dirs: u64,
+    pub failed: u64,
+    pub bytes: u64,
+    pub current: String,
+    pub done: bool,
 }
 
 fn path_base_name(path: &str) -> String {
@@ -270,6 +299,7 @@ fn export_file(
     entry: &EntryDto,
     dest: &Path,
     st: &mut ExportStats,
+    on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) {
     if let Some(par) = dest.parent() {
         let _ = fs::create_dir_all(par);
@@ -292,6 +322,7 @@ fn export_file(
         Ok(n) => {
             st.files += 1;
             st.bytes += n;
+            on_progress(st, &entry.path);
         }
         Err(_) => st.failed += 1,
     }
@@ -303,6 +334,7 @@ fn export_dir(
     dest: &Path,
     st: &mut ExportStats,
     depth: usize,
+    on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) {
     // 防符号链接自指或异常深目录把栈打爆
     if depth > 64 {
@@ -321,6 +353,7 @@ fn export_dir(
             return;
         }
     };
+    on_progress(st, src);
     for e in entries {
         if e.name == "." || e.name == ".." {
             continue;
@@ -332,35 +365,92 @@ fn export_dir(
         }
         let p = dest.join(&name);
         if e.is_dir {
-            export_dir(b, &e.path, &p, st, depth + 1);
+            export_dir(b, &e.path, &p, st, depth + 1, on_progress);
         } else {
-            export_file(b, &e, &p, st);
+            export_file(b, &e, &p, st, on_progress);
         }
     }
 }
 
-/// 导出当前路径（目录递归或单文件）到 `out_dir`，保持原有目录结构。
+/// 导出当前路径（目录递归或单文件）到 `out_dir`，边导边通过事件上报进度。
 #[tauri::command]
-pub fn export_path(
-    state: tauri::State<AppState>,
+pub async fn export_path(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
     path: String,
     out_dir: String,
 ) -> Result<String, String> {
-    let mut guard = state.backend.lock().map_err(|_| not_open())?;
-    let b = guard.as_mut().ok_or_else(not_open)?;
-    do_export(b, &path, &out_dir)
+    // 把后端独占取出：既避免跨线程借用，也保证导出期间不会被别的命令插队
+    let backend = {
+        let mut g = state.backend.lock().map_err(|_| not_open())?;
+        g.take().ok_or_else(not_open)?
+    };
+
+    let handle = app.clone();
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let mut b = backend;
+        let mut last = std::time::Instant::now();
+        let res = do_export_with(&mut b, &path, &out_dir, &mut |st, cur| {
+            // 节流：导出几万个小文件时，每个都发事件会把 WebView 拖死
+            if last.elapsed().as_millis() >= 120 {
+                last = std::time::Instant::now();
+                let _ = tauri::Emitter::emit(
+                    &handle,
+                    "export-progress",
+                    ExportProgress {
+                        files: st.files,
+                        dirs: st.dirs,
+                        failed: st.failed,
+                        bytes: st.bytes,
+                        current: cur.to_string(),
+                        done: false,
+                    },
+                );
+            }
+        });
+        (b, res)
+    })
+    .await;
+
+    match joined {
+        Ok((b, res)) => {
+            let mut g = state.backend.lock().map_err(|_| not_open())?;
+            *g = Some(b);
+            let _ = tauri::Emitter::emit(
+                &app,
+                "export-progress",
+                ExportProgress { done: true, ..Default::default() },
+            );
+            res
+        }
+        Err(e) => {
+            let _ = tauri::Emitter::emit(
+                &app,
+                "export-progress",
+                ExportProgress { done: true, ..Default::default() },
+            );
+            Err(format!("导出任务异常: {e}"))
+        }
+    }
 }
 
 /// 导出核心（与 Tauri 解耦，便于直接测试）。
 pub fn do_export(b: &mut Backend, path: &str, out_dir: &str) -> Result<String, String> {
+    do_export_with(b, path, out_dir, &mut |_, _| {})
+}
+
+pub fn do_export_with(
+    b: &mut Backend,
+    path: &str,
+    out_dir: &str,
+    on_progress: &mut dyn FnMut(&ExportStats, &str),
+) -> Result<String, String> {
     let root = PathBuf::from(out_dir);
     fs::create_dir_all(&root).map_err(|e| format!("无法创建输出目录 {out_dir}: {e}"))?;
 
     // 必须先 stat：`list_dir` 对普通文件也会返回空列表，
     // 靠"列不出东西"猜类型会把文件当空目录建出来。
-    let entry = b
-        .stat(path)?
-        .ok_or_else(|| format!("路径不存在: {path}"))?;
+    let entry = b.stat(path)?.ok_or_else(|| format!("路径不存在: {path}"))?;
 
     let name = sanitize_name(&path_base_name(path));
     let dest = root.join(&name);
@@ -369,6 +459,7 @@ pub fn do_export(b: &mut Backend, path: &str, out_dir: &str) -> Result<String, S
     if entry.is_dir {
         fs::create_dir_all(&dest).map_err(|e| format!("创建 {} 失败: {e}", dest.display()))?;
         st.dirs += 1;
+        on_progress(&st, path);
         let entries = b.list_dir(path, false)?;
         for e in entries {
             if e.name == "." || e.name == ".." {
@@ -381,13 +472,13 @@ pub fn do_export(b: &mut Backend, path: &str, out_dir: &str) -> Result<String, S
             }
             let p = dest.join(&n);
             if e.is_dir {
-                export_dir(b, &e.path, &p, &mut st, 1);
+                export_dir(b, &e.path, &p, &mut st, 1, on_progress);
             } else {
-                export_file(b, &e, &p, &mut st);
+                export_file(b, &e, &p, &mut st, on_progress);
             }
         }
     } else {
-        export_file(b, &entry, &dest, &mut st);
+        export_file(b, &entry, &dest, &mut st, on_progress);
     }
 
     Ok(format!(

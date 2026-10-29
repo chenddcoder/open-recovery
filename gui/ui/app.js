@@ -301,6 +301,28 @@ async function recoverAll() {
 
 $("btn-refresh").onclick = loadDisks;
 
+// ---------------- 导出进度 ----------------
+// 后端每 120ms 最多发一帧，避免几万个小文件把 WebView 拖死
+let exportListener = null;
+
+async function ensureExportListener() {
+  if (exportListener) return;
+  const ev = window.__TAURI__ && window.__TAURI__.event;
+  if (!ev) return; // 老版本没有 event API 时静默降级
+  exportListener = await ev.listen("export-progress", (e) => {
+    const p = e.payload || {};
+    const box = $("export-progress");
+    if (p.done) {
+      box.hidden = true;
+      return;
+    }
+    box.hidden = false;
+    const parts = [`${p.files} 个文件`, `${p.dirs} 个目录`, fmtSize(p.bytes || 0)];
+    if (p.failed) parts.push(`失败 ${p.failed}`);
+    $("export-progress-text").textContent = `${parts.join(" · ")}\n${p.current || ""}`;
+  });
+}
+
 // 导出当前浏览的目录（递归）；这是"挑着恢复"的主入口
 $("btn-export").onclick = async () => {
   if (!state.source) {
@@ -313,15 +335,25 @@ $("btn-export").onclick = async () => {
     return;
   }
   const p = state.path || "/";
-  setStatus(`正在导出 ${p} …（目录大时可能需要几分钟，请勿关闭窗口）`);
-  $("btn-export").disabled = true;
+  setStatus(`正在导出 ${p} …`);
+  const btn = $("btn-export");
+  const up = $("btn-up");
+  btn.disabled = true;
+  if (up) up.disabled = true;
+  await ensureExportListener();
+  const box = $("export-progress");
+  box.hidden = false;
+  $("export-progress-text").textContent = "正在准备…";
   try {
     const msg = await invoke("export_path", { path: p, outDir });
     setStatus(msg, "ok");
   } catch (e) {
     setStatus(String(e), "error");
   } finally {
-    $("btn-export").disabled = false;
+    // done 事件一般已经隐藏了，这里兜底（比如事件丢失）
+    box.hidden = true;
+    btn.disabled = false;
+    if (up) up.disabled = false;
   }
 };
 $("btn-admin").onclick = requestAdmin;

@@ -187,3 +187,32 @@ button.ghost { background: transparent; }
 }
 .stats { color: var(--text-dim); }
 .hidden { display: none !important; }
+
+/* 导出进度：总量未知（不能先扫一遍 766 万文件），所以用不定长滚动条 + 实时数字 */
+.export-progress { margin-top: 10px; }
+.export-progress .bar {
+  height: 6px;
+  border-radius: 3px;
+  background: #1a2130;
+  overflow: hidden;
+}
+.export-progress .bar .fill {
+  height: 100%;
+  width: 35%;
+  border-radius: 3px;
+  background: linear-gradient(90deg, #3b82f6, #22d3ee);
+  animation: dmde-indet 1.15s ease-in-out infinite;
+}
+@keyframes dmde-indet {
+  0%   { transform: translateX(-110%); }
+  100% { transform: translateX(330%); }
+}
+.export-progress .progress-text {
+  margin-top: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #8b97ab;
+  word-break: break-all;
+  max-height: 44px;
+  overflow: hidden;
+}
