@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/dmdisk", "crates/dmfs", "crates/dmcli"]
+members = ["crates/dmdisk", "crates/dmfs", "crates/dmcli", "crates/dmrpc", "crates/dmhelper"]
 # GUI 依赖 Tauri，独立构建，不进主工作区（保证 `cargo test` 只跑核心引擎）
 exclude = ["gui/src-tauri"]
 
@@ -15,6 +15,7 @@ description = "Open-source disk editor and data recovery toolkit (DMDE-alike)"
 [workspace.dependencies]
 dmdisk = { path = "crates/dmdisk" }
 dmfs = { path = "crates/dmfs" }
+dmrpc = { path = "crates/dmrpc" }
 
 [profile.release]
 opt-level = 3

@@ -7,6 +7,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/gui/src-tauri/target/release/dmde-gui"
+HELPER="$ROOT/target/release/dmde-rs-helper"
 ICON="$ROOT/gui/src-tauri/icons/icon.png"
 APP="$ROOT/dist/dmde-rs.app"
 
@@ -14,10 +15,16 @@ if [ ! -x "$BIN" ]; then
   echo "先构建 release：cd gui/src-tauri && cargo build --release" >&2
   exit 1
 fi
+if [ ! -x "$HELPER" ]; then
+  echo "先构建 helper：cargo build --release -p dmhelper" >&2
+  exit 1
+fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/dmde-rs"
+# 只读特权 helper：GUI 通过系统授权窗拉起它读 /dev/rdisk*
+cp "$HELPER" "$APP/Contents/MacOS/dmde-rs-helper"
 
 # png → iconset → icns
 if [ -f "$ICON" ] && command -v iconutil >/dev/null; then

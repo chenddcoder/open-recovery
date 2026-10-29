@@ -56,6 +56,8 @@ body {
   border: 1px solid var(--border); color: var(--text-dim);
 }
 .pill.safe { color: var(--ok); border-color: #1f4a3d; background: #10241f; }
+.pill.warn { color: #d9a441; border-color: #4a3c1f; background: #241f10; }
+.pill.admin { color: var(--accent, #3b82f6); border-color: #1f3355; background: #101a2b; }
 
 /* ---------- 布局 ---------- */
 .layout {

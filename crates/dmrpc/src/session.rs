@@ -1,0 +1,265 @@
+//! 一个已挂载会话：打开源 → 定位卷 → 列目录 / 预览 / 读文件。
+//!
+//! GUI（本地镜像）和 helper（特权设备）都调这里的实现，保证两边行为完全一致；
+//! 提权只是把 `AnyFs` 放在另一个进程里，解析逻辑一行都没有分叉。
+
+use dmdisk::{human_size, Source};
+use dmfs::{resolve, AnyFs, Entry, FileSystem, FsKind};
+use std::collections::HashMap;
+use std::io::Write;
+
+use crate::model::{EntryDto, PartDto, PreviewDto, SourceDto};
+
+/// 打开失败。`permission` 为真表示"这台机器上需要更高权限"，GUI 据此弹授权窗。
+#[derive(Debug, Clone)]
+pub struct OpenError {
+    pub message: String,
+    pub permission: bool,
+}
+
+impl OpenError {
+    pub fn plain(message: impl Into<String>) -> Self {
+        Self { message: message.into(), permission: false }
+    }
+}
+
+impl From<dmfs::Error> for OpenError {
+    fn from(e: dmfs::Error) -> Self {
+        Self { permission: matches!(e, dmfs::Error::Permission(_)), message: e.to_string() }
+    }
+}
+
+pub struct Session {
+    pub source: String,
+    pub desc: String,
+    pub fs: AnyFs,
+    /// 见过条目按 id 缓存：已删除项没有可用路径，按 id 读最稳。
+    cache: HashMap<u64, Entry>,
+}
+
+impl Session {
+    pub fn list_dir(&mut self, path: &str, show_deleted: bool) -> Result<Vec<EntryDto>, String> {
+        let node = if path == "/" || path.is_empty() {
+            self.fs.root()
+        } else {
+            resolve(&self.fs, path)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| format!("路径不存在: {path}"))?
+                .id
+        };
+        let entries = self.fs.list(node).map_err(|e| e.to_string())?;
+        self.remember(&entries);
+        let mut out = entries;
+        if !show_deleted {
+            out.retain(|e| !e.deleted);
+        }
+        out.sort_by_key(|e| (!e.is_dir(), e.name.to_lowercase()));
+        let base = if path.is_empty() { "/" } else { path };
+        Ok(out.iter().map(|e| to_dto(base, e)).collect())
+    }
+
+    pub fn preview(&self, path: &str, max: usize) -> Result<PreviewDto, String> {
+        let entry = resolve(&self.fs, path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("路径不存在: {path}"))?;
+        self.preview_entry(&entry, max)
+    }
+
+    /// 按 id 预览：已删除项没有可信路径，只能走这条。
+    pub fn preview_by_id(&self, id: u64, max: usize) -> Result<PreviewDto, String> {
+        let entry = self
+            .cache
+            .get(&id)
+            .ok_or_else(|| "条目已失效，请重新浏览或重新扫描".to_string())?;
+        self.preview_entry(entry, max)
+    }
+
+    fn preview_entry(&self, entry: &Entry, max: usize) -> Result<PreviewDto, String> {
+        if entry.is_dir() {
+            return Err("目录不能预览".into());
+        }
+        let mut buf = Vec::new();
+        self.fs.read(&entry, &mut buf).map_err(|e| e.to_string())?;
+        let truncated = buf.len() > max;
+        if truncated {
+            buf.truncate(max);
+        }
+        let (text, mode) = match String::from_utf8(buf.clone()) {
+            Ok(t) => {
+                let ctrl = t
+                    .chars()
+                    .filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t')
+                    .count();
+                if ctrl * 20 > t.chars().count().max(1) {
+                    (hex_dump(&buf), "hex".to_string())
+                } else {
+                    (t, "text".to_string())
+                }
+            }
+            Err(_) => (hex_dump(&buf), "hex".to_string()),
+        };
+        Ok(PreviewDto { text, mode, size: entry.size, truncated })
+    }
+
+    pub fn deleted(&mut self, limit: usize) -> Result<Vec<EntryDto>, String> {
+        if !self.fs.supports_deleted() {
+            return Err(format!(
+                "{} 删除时会销毁目录记录，需要用签名雕刻恢复（规划中）",
+                self.fs.info().kind.as_str()
+            ));
+        }
+        let mut items = self.fs.deleted().map_err(|e| e.to_string())?;
+        self.remember(&items);
+        if limit > 0 {
+            items.truncate(limit);
+        }
+        Ok(items.iter().map(|e| to_dto("", e)).collect())
+    }
+
+    pub fn read_id(&self, id: u64, out: &mut dyn Write) -> Result<u64, String> {
+        let entry = self
+            .cache
+            .get(&id)
+            .ok_or_else(|| "条目已失效，请重新浏览或重新扫描".to_string())?;
+        self.fs.read(entry, out).map_err(|e| e.to_string())
+    }
+
+    pub fn read_path(&self, path: &str, out: &mut dyn Write) -> Result<u64, String> {
+        let entry = resolve(&self.fs, path)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("路径不存在: {path}"))?;
+        if entry.is_dir() {
+            return Err("目录不能按文件读取".into());
+        }
+        self.fs.read(&entry, out).map_err(|e| e.to_string())
+    }
+
+    fn remember(&mut self, entries: &[Entry]) {
+        for e in entries {
+            self.cache.insert(e.id.0, e.clone());
+        }
+    }
+}
+
+/// 打开源；`partition` 为 None 时自动挑选唯一可挂载分区。
+pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDto), OpenError> {
+    let src = Source::open(source, 0)?;
+    let table = src.table().map_err(OpenError::from)?;
+
+    let mut partitions = Vec::new();
+    for p in &table.partitions {
+        let kind = dmfs::probe(&src.volume(p.offset, p.size));
+        partitions.push(PartDto {
+            index: p.index,
+            type_name: p.type_name.clone(),
+            size: p.size,
+            size_human: human_size(p.size),
+            offset: p.offset,
+            fs_kind: kind.as_str().to_string(),
+            mountable: kind != FsKind::Unknown && kind != FsKind::Apfs,
+        });
+    }
+
+    let (reader, desc) = match partition {
+        Some(idx) => {
+            let p = table
+                .partitions
+                .get(idx.saturating_sub(1))
+                .ok_or_else(|| OpenError::plain(format!("分区 {idx} 不存在")))?;
+            (src.volume(p.offset, p.size), format!("{source} 分区{idx}（{}）", p.type_name))
+        }
+        None => {
+            if dmfs::probe(&src.reader) != FsKind::Unknown {
+                (src.reader.slice(0, src.size), source.to_string())
+            } else {
+                let cands: Vec<_> = table
+                    .partitions
+                    .iter()
+                    .filter(|p| {
+                        let k = dmfs::probe(&src.volume(p.offset, p.size));
+                        k != FsKind::Unknown && k != FsKind::Apfs
+                    })
+                    .collect();
+                match cands.len() {
+                    0 => {
+                        return Err(OpenError::plain(format!(
+                            "{source} 上没有可挂载的文件系统（分区表 {}）",
+                            table.scheme.as_str()
+                        )))
+                    }
+                    1 => {
+                        let p = cands[0];
+                        (
+                            src.volume(p.offset, p.size),
+                            format!("{source} 分区{}（{}）", p.index, p.type_name),
+                        )
+                    }
+                    _ => {
+                        return Err(OpenError::plain(format!(
+                            "该源有多个可挂载分区，请先选择分区（共 {} 个）",
+                            cands.len()
+                        )))
+                    }
+                }
+            }
+        }
+    };
+
+    let fs = AnyFs::open(reader).map_err(OpenError::from)?;
+    let info = fs.info().clone();
+    let dto = SourceDto {
+        desc: desc.clone(),
+        scheme: table.scheme.as_str().to_string(),
+        verified: table.verified,
+        notes: table.notes.clone(),
+        partitions,
+        fs_kind: info.kind.as_str().to_string(),
+        label: info.label.clone(),
+        uuid: info.uuid.clone().unwrap_or_default(),
+        block_size: info.block_size,
+        total_bytes: info.total_bytes,
+        total_human: human_size(info.total_bytes),
+        free_bytes: info.free_bytes,
+        details: info.details.clone(),
+    };
+    Ok((Session { source: source.to_string(), desc, fs, cache: HashMap::new() }, dto))
+}
+
+fn to_dto(base: &str, e: &Entry) -> EntryDto {
+    let path = if base == "/" || base.is_empty() {
+        format!("/{}", e.name)
+    } else {
+        format!("{}/{}", base.trim_end_matches('/'), e.name)
+    };
+    EntryDto {
+        name: e.name.clone(),
+        path,
+        id: e.id.0,
+        is_dir: e.is_dir(),
+        size: e.size,
+        size_human: human_size(e.size),
+        deleted: e.deleted,
+        mtime: e.mtime,
+        name_lost: e.name_lost,
+    }
+}
+
+fn hex_dump(buf: &[u8]) -> String {
+    let mut out = String::with_capacity(buf.len() * 4);
+    for (i, chunk) in buf.chunks(16).enumerate() {
+        out.push_str(&format!("{:08x}  ", i * 16));
+        for b in chunk {
+            out.push_str(&format!("{b:02x} "));
+        }
+        for _ in chunk.len()..16 {
+            out.push_str("   ");
+        }
+        out.push_str(" |");
+        for b in chunk {
+            let c = *b as char;
+            out.push(if c.is_ascii_graphic() || c == ' ' { c } else { '.' });
+        }
+        out.push_str("|\n");
+    }
+    out
+}

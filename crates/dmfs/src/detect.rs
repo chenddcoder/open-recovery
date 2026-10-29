@@ -81,7 +81,10 @@ impl AnyFs {
             }
             FsKind::HfsPlus => Ok(AnyFs::HfsPlus(crate::hfsplus::HfsPlus::open(reader)?)),
             FsKind::Apfs => Err(Error::Unsupported(
-                "APFS 尚未支持（容器/快照结构复杂，规划中）".into(),
+                "APFS 目前只做到容器识别：能认出这是 APFS 容器，但还不能列目录/读文件。\
+                 文件级解析（对象映射 B-tree、fs-tree、快照）正在实现中；\
+                 `dmde-rs volumes` 可以看到容器与卷的基本信息"
+                    .into(),
             )),
             FsKind::Unknown => Err(Error::Format("无法识别的文件系统".into())),
         }

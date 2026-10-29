@@ -643,6 +643,7 @@ version = "0.1.0"
 dependencies = [
  "dmdisk",
  "dmfs",
+ "dmrpc",
  "serde",
  "serde_json",
  "tauri",
@@ -658,6 +659,16 @@ name = "dmfs"
 version = "0.1.0"
 dependencies = [
  "dmdisk",
+]
+
+[[package]]
+name = "dmrpc"
+version = "0.1.0"
+dependencies = [
+ "dmdisk",
+ "dmfs",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

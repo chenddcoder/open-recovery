@@ -1,222 +1,41 @@
-//! 前端可调用的命令：全部围绕"当前挂载的卷"这个唯一的会话状态。
+//! 前端可调用的命令。全部围绕"当前会话"这一个状态。
+//!
+//! 会话有两种后端：
+//! * `Local`  —— 镜像文件 / 已有权限的设备，本进程直接读；
+//! * `Remote` —— `/dev/rdisk*`，经系统授权弹窗拉起的只读 helper 读。
+//! 前端不用关心是哪一种，命令签名完全一样。
 
-use crate::AppState;
-use dmdisk::{human_size, Source};
-use dmfs::{resolve, sanitize_name, AnyFs, Entry, FileSystem, FsKind};
-use serde::Serialize;
+use crate::{priv_helper, AppState};
+use dmrpc::{open_local, Backend, EntryDto, PreviewDto, RecoverDto, SourceDto};
+use dmfs::sanitize_name;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 fn not_open() -> String {
     "还没有打开任何卷".to_string()
 }
 
-// ---------------- DTO ----------------
-
-#[derive(Serialize)]
-pub struct DiskDto {
-    pub dev_node: String,
-    pub bsd: String,
-    pub size: u64,
-    pub size_human: String,
-    pub model: String,
-    pub bus: String,
-    pub internal: bool,
-    pub removable: bool,
-}
-
-#[derive(Serialize)]
-pub struct PartDto {
-    pub index: usize,
-    pub type_name: String,
-    pub size: u64,
-    pub size_human: String,
-    pub offset: u64,
-    pub fs_kind: String,
-    pub mountable: bool,
-}
-
-#[derive(Serialize)]
-pub struct SourceDto {
-    pub desc: String,
-    pub scheme: String,
-    pub verified: bool,
-    pub notes: Vec<String>,
-    pub partitions: Vec<PartDto>,
-    pub fs_kind: String,
-    pub label: String,
-    pub uuid: String,
-    pub block_size: u32,
-    pub total_bytes: u64,
-    pub total_human: String,
-    pub free_bytes: Option<u64>,
-    pub details: Vec<(String, String)>,
-}
-
-#[derive(Serialize)]
-pub struct EntryDto {
-    pub name: String,
-    pub path: String,
-    pub id: u64,
-    pub is_dir: bool,
-    pub size: u64,
-    pub size_human: String,
-    pub deleted: bool,
-    pub mtime: Option<i64>,
-    pub name_lost: bool,
-}
-
-#[derive(Serialize)]
-pub struct PreviewDto {
-    pub text: String,
-    pub mode: String,
-    pub size: u64,
-    pub truncated: bool,
-}
-
-#[derive(Serialize)]
-pub struct RecoverDto {
-    pub ok: u64,
-    pub failed: u64,
-    pub bytes: u64,
-    pub bytes_human: String,
-    pub out_dir: String,
-    pub saved: Vec<String>,
-}
-
-// ---------------- 命令 ----------------
-
-#[tauri::command]
-pub fn list_disks() -> Result<Vec<DiskDto>, String> {
-    let disks = dmdisk::list_disks().map_err(|e| e.to_string())?;
-    Ok(disks
-        .into_iter()
-        .map(|d| DiskDto {
-            size_human: human_size(d.size),
-            dev_node: d.dev_node,
-            bsd: d.bsd,
-            size: d.size,
-            model: d.model,
-            bus: d.bus,
-            internal: d.internal,
-            removable: d.removable,
-        })
-        .collect())
-}
-
-/// 打开源；`partition` 为 None 时自动挑选唯一可挂载分区。
+/// 有权限就直接开；只有"权限不足"才值得弹授权窗——其它错误（路径不存在、
+/// 格式不认识）弹密码窗纯属骚扰用户。
 #[tauri::command]
 pub fn open_source(
     state: tauri::State<AppState>,
     path: String,
     partition: Option<usize>,
 ) -> Result<SourceDto, String> {
-    let src = Source::open(&path, 0).map_err(|e| e.to_string())?;
-    let table = src.table().map_err(|e| e.to_string())?;
-
-    let mut partitions = Vec::new();
-    for p in &table.partitions {
-        let kind = dmfs::probe(&src.volume(p.offset, p.size));
-        partitions.push(PartDto {
-            index: p.index,
-            type_name: p.type_name.clone(),
-            size: p.size,
-            size_human: human_size(p.size),
-            offset: p.offset,
-            fs_kind: kind.as_str().to_string(),
-            mountable: kind != FsKind::Unknown && kind != FsKind::Apfs,
-        });
-    }
-
-    let (reader, desc) = match partition {
-        Some(idx) => {
-            let p = table
-                .partitions
-                .get(idx.saturating_sub(1))
-                .ok_or_else(|| format!("分区 {idx} 不存在"))?;
-            (
-                src.volume(p.offset, p.size),
-                format!("{path} 分区{idx}（{}）", p.type_name),
-            )
+    let mut guard = state.backend.lock().map_err(|_| not_open())?;
+    match open_local(&path, partition) {
+        Ok((s, dto)) => {
+            *guard = Some(Backend::Local(s));
+            Ok(dto)
         }
-        None => {
-            if dmfs::probe(&src.reader) != FsKind::Unknown {
-                (src.reader.slice(0, src.size), path.clone())
-            } else {
-                let cands: Vec<_> = table
-                    .partitions
-                    .iter()
-                    .filter(|p| {
-                        let k = dmfs::probe(&src.volume(p.offset, p.size));
-                        k != FsKind::Unknown && k != FsKind::Apfs
-                    })
-                    .collect();
-                match cands.len() {
-                    0 => {
-                        return Err(format!(
-                            "{path} 上没有可挂载的文件系统（分区表 {}）",
-                            table.scheme.as_str()
-                        ))
-                    }
-                    1 => {
-                        let p = cands[0];
-                        (
-                            src.volume(p.offset, p.size),
-                            format!("{path} 分区{}（{}）", p.index, p.type_name),
-                        )
-                    }
-                    _ => return Err("该源有多个可挂载分区，请先选择分区".to_string()),
-                }
-            }
+        Err(e) if e.permission => {
+            let mut client = priv_helper::connect()?;
+            let dto = client.open(&path, partition)?;
+            *guard = Some(Backend::Remote(client));
+            Ok(dto)
         }
-    };
-
-    let fs = AnyFs::open(reader).map_err(|e| e.to_string())?;
-    let info = fs.info().clone();
-    let dto = SourceDto {
-        desc: desc.clone(),
-        scheme: table.scheme.as_str().to_string(),
-        verified: table.verified,
-        notes: table.notes.clone(),
-        partitions,
-        fs_kind: info.kind.as_str().to_string(),
-        label: info.label.clone(),
-        uuid: info.uuid.clone().unwrap_or_default(),
-        block_size: info.block_size,
-        total_bytes: info.total_bytes,
-        total_human: human_size(info.total_bytes),
-        free_bytes: info.free_bytes,
-        details: info.details.clone(),
-    };
-
-    {
-        let mut guard = state.session.lock().map_err(|e| e.to_string())?;
-        *guard = Some(crate::Session {
-            source: path,
-            desc,
-            fs,
-        });
-    }
-    Ok(dto)
-}
-
-fn entry_dto(base: &str, e: &Entry) -> EntryDto {
-    let path = if base == "/" || base.is_empty() {
-        format!("/{}", e.name)
-    } else {
-        format!("{}/{}", base.trim_end_matches('/'), e.name)
-    };
-    EntryDto {
-        name: e.name.clone(),
-        path,
-        id: e.id.0,
-        is_dir: e.is_dir(),
-        size: e.size,
-        size_human: human_size(e.size),
-        deleted: e.deleted,
-        mtime: e.mtime,
-        name_lost: e.name_lost,
+        Err(e) => Err(e.message),
     }
 }
 
@@ -226,86 +45,35 @@ pub fn list_dir(
     path: String,
     show_deleted: bool,
 ) -> Result<Vec<EntryDto>, String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let s = guard.as_ref().ok_or_else(not_open)?;
-    let node = if path == "/" || path.is_empty() {
-        s.fs.root()
-    } else {
-        resolve(&s.fs, &path)
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("路径不存在: {path}"))?
-            .id
-    };
-    let mut entries = s.fs.list(node).map_err(|e| e.to_string())?;
-    if !show_deleted {
-        entries.retain(|e| !e.deleted);
-    }
-    entries.sort_by_key(|e| (!e.is_dir(), e.name.to_lowercase()));
-    let base = if path.is_empty() { "/" } else { &path };
-    Ok(entries.iter().map(|e| entry_dto(base, e)).collect())
+    let mut guard = state.backend.lock().map_err(|_| not_open())?;
+    let b = guard.as_mut().ok_or_else(not_open)?;
+    b.list_dir(&path, show_deleted)
 }
 
 #[tauri::command]
 pub fn preview(
     state: tauri::State<AppState>,
+    id: u64,
     path: String,
     max: Option<usize>,
 ) -> Result<PreviewDto, String> {
     let limit = max.unwrap_or(256 * 1024);
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let s = guard.as_ref().ok_or_else(not_open)?;
-    let entry = resolve(&s.fs, &path)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("路径不存在: {path}"))?;
-    if entry.is_dir() {
-        return Err("目录不能预览".into());
+    let mut guard = state.backend.lock().map_err(|_| not_open())?;
+    let b = guard.as_mut().ok_or_else(not_open)?;
+    if id > 0 {
+        return b.preview_id(id, limit);
     }
-    let mut buf = Vec::new();
-    s.fs.read(&entry, &mut buf).map_err(|e| e.to_string())?;
-    let truncated = buf.len() > limit;
-    if truncated {
-        buf.truncate(limit);
-    }
-    let (text, mode) = match String::from_utf8(buf.clone()) {
-        Ok(t) => {
-            let ctrl = t
-                .chars()
-                .filter(|c| c.is_control() && *c != '\n' && *c != '\r' && *c != '\t')
-                .count();
-            if ctrl * 20 > t.chars().count().max(1) {
-                (hex_dump(&buf), "hex".to_string())
-            } else {
-                (t, "text".to_string())
-            }
-        }
-        Err(_) => (hex_dump(&buf), "hex".to_string()),
-    };
-    Ok(PreviewDto {
-        text,
-        mode,
-        size: entry.size,
-        truncated,
-    })
+    b.preview(&path, limit)
 }
 
-fn hex_dump(buf: &[u8]) -> String {
-    let mut out = String::with_capacity(buf.len() * 4);
-    for (i, chunk) in buf.chunks(16).enumerate() {
-        out.push_str(&format!("{:08x}  ", i * 16));
-        for b in chunk {
-            out.push_str(&format!("{b:02x} "));
-        }
-        for _ in chunk.len()..16 {
-            out.push_str("   ");
-        }
-        out.push_str(" |");
-        for b in chunk {
-            let c = *b as char;
-            out.push(if c.is_ascii_graphic() || c == ' ' { c } else { '.' });
-        }
-        out.push_str("|\n");
-    }
-    out
+#[tauri::command]
+pub fn scan_deleted(
+    state: tauri::State<AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<EntryDto>, String> {
+    let mut guard = state.backend.lock().map_err(|_| not_open())?;
+    let b = guard.as_mut().ok_or_else(not_open)?;
+    b.deleted(limit.unwrap_or(0))
 }
 
 fn unique_path(dir: &Path, name: &str) -> PathBuf {
@@ -318,47 +86,47 @@ fn unique_path(dir: &Path, name: &str) -> PathBuf {
     target
 }
 
-#[tauri::command]
-pub fn save_file(
-    state: tauri::State<AppState>,
-    path: String,
-    out_dir: String,
-) -> Result<String, String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let s = guard.as_ref().ok_or_else(not_open)?;
-    let entry = resolve(&s.fs, &path)
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("路径不存在: {path}"))?;
-    if entry.is_dir() {
-        return Err("暂不支持整目录导出，请逐个文件保存".into());
-    }
-    fs::create_dir_all(&out_dir).map_err(|e| format!("创建 {out_dir} 失败: {e}"))?;
-    let target = unique_path(Path::new(&out_dir), &sanitize_name(&entry.name));
-    let file = fs::File::create(&target).map_err(|e| e.to_string())?;
+/// 读一个条目并写到本地。写盘由 GUI 自己完成（非 root），属主、TCC、
+/// 目录权限都天然正确；helper 只负责把字节吐回来。
+fn dump_to_dir(
+    b: &mut Backend,
+    id: u64,
+    name: &str,
+    out_dir: &str,
+) -> Result<(PathBuf, u64), String> {
+    fs::create_dir_all(out_dir).map_err(|e| format!("创建 {out_dir} 失败: {e}"))?;
+    let target = unique_path(Path::new(out_dir), &sanitize_name(name));
+    let file = fs::File::create(&target).map_err(|e| format!("创建 {} 失败: {e}", target.display()))?;
     let mut w = std::io::BufWriter::new(file);
-    let n = s.fs.read(&entry, &mut w).map_err(|e| e.to_string())?;
-    w.flush().ok();
-    Ok(format!("已保存 {}（{} 字节）", target.display(), n))
+    match b.read_id(id, &mut w) {
+        Ok(n) if n > 0 => {
+            use std::io::Write;
+            w.flush().ok();
+            Ok((target, n))
+        }
+        Ok(_) => {
+            let _ = fs::remove_file(&target);
+            Err("读到 0 字节".into())
+        }
+        Err(e) => {
+            // 半成品文件必须删掉，否则恢复目录里混着截断文件最坑人
+            let _ = fs::remove_file(&target);
+            Err(e)
+        }
+    }
 }
 
 #[tauri::command]
-pub fn scan_deleted(
+pub fn save_file(
     state: tauri::State<AppState>,
-    limit: Option<usize>,
-) -> Result<Vec<EntryDto>, String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let s = guard.as_ref().ok_or_else(not_open)?;
-    if !s.fs.supports_deleted() {
-        return Err(format!(
-            "{} 删除时会销毁目录记录，需要用签名雕刻恢复（规划中）",
-            s.fs.info().kind.as_str()
-        ));
-    }
-    let mut items = s.fs.deleted().map_err(|e| e.to_string())?;
-    if let Some(l) = limit {
-        items.truncate(l);
-    }
-    Ok(items.iter().map(|e| entry_dto("", e)).collect())
+    id: u64,
+    name: String,
+    out_dir: String,
+) -> Result<String, String> {
+    let mut guard = state.backend.lock().map_err(|_| not_open())?;
+    let b = guard.as_mut().ok_or_else(not_open)?;
+    let (target, n) = dump_to_dir(b, id, &name, &out_dir)?;
+    Ok(format!("已保存 {}（{n} 字节）", target.display()))
 }
 
 #[tauri::command]
@@ -368,11 +136,11 @@ pub fn recover_all(
     min_size: u64,
     limit: usize,
 ) -> Result<RecoverDto, String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let s = guard.as_ref().ok_or_else(not_open)?;
+    let mut guard = state.backend.lock().map_err(|_| not_open())?;
+    let b = guard.as_mut().ok_or_else(not_open)?;
     fs::create_dir_all(&out_dir).map_err(|e| format!("创建 {out_dir} 失败: {e}"))?;
-    let mut items = s.fs.deleted().map_err(|e| e.to_string())?;
-    items.retain(|e| e.size >= min_size);
+    let mut items = b.deleted(0)?;
+    items.retain(|e| !e.is_dir && e.size >= min_size);
     if limit > 0 {
         items.truncate(limit);
     }
@@ -381,33 +149,20 @@ pub fn recover_all(
     let mut bytes = 0u64;
     let mut saved = Vec::new();
     for e in &items {
-        let target = unique_path(Path::new(&out_dir), &sanitize_name(&e.name));
-        let file = match fs::File::create(&target) {
-            Ok(f) => f,
-            Err(_) => {
-                failed += 1;
-                continue;
-            }
-        };
-        let mut w = std::io::BufWriter::new(file);
-        match s.fs.read(e, &mut w) {
-            Ok(n) if n > 0 => {
-                w.flush().ok();
+        match dump_to_dir(b, e.id, &e.name, &out_dir) {
+            Ok((p, n)) => {
                 ok += 1;
                 bytes += n;
-                saved.push(target.display().to_string());
+                saved.push(p.display().to_string());
             }
-            _ => {
-                failed += 1;
-                let _ = fs::remove_file(&target);
-            }
+            Err(_) => failed += 1,
         }
     }
     Ok(RecoverDto {
         ok,
         failed,
         bytes,
-        bytes_human: human_size(bytes),
+        bytes_human: dmdisk::human_size(bytes),
         out_dir,
         saved,
     })
@@ -420,10 +175,55 @@ pub fn default_out_dir() -> String {
     format!("{home}/Downloads/dmde-rs-recovered")
 }
 
+#[derive(serde::Serialize)]
+pub struct AdminState {
+    /// 当前会话是否由特权 helper 提供
+    pub active: bool,
+    /// 提权通道是否可用（helper 活着）
+    pub helper: bool,
+    /// 当前会话后端：local / admin
+    pub backend: String,
+}
+
+#[tauri::command]
+pub fn admin_state(state: tauri::State<AppState>) -> AdminState {
+    let backend = state
+        .backend
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|b| b.kind().to_string()))
+        .unwrap_or_else(|| "none".into());
+    AdminState {
+        active: backend == "admin",
+        helper: priv_helper::alive(),
+        backend,
+    }
+}
+
+/// 主动请求管理员权限（会弹出 macOS 标准授权窗）。
+#[tauri::command]
+pub fn request_admin() -> Result<String, String> {
+    let mut c = priv_helper::connect()?;
+    c.ping()?;
+    Ok("已获得管理员权限（只读）".to_string())
+}
+
+/// 放弃管理员权限：helper 收到 shutdown 后自行退出。
+#[tauri::command]
+pub fn drop_admin(state: tauri::State<AppState>) -> Result<String, String> {
+    {
+        let mut guard = state.backend.lock().map_err(|_| not_open())?;
+        if matches!(guard.as_ref(), Some(Backend::Remote(_))) {
+            *guard = None;
+        }
+    }
+    priv_helper::shutdown();
+    Ok("已退出提权模式".into())
+}
+
 #[tauri::command]
 pub fn current_source(state: tauri::State<AppState>) -> Result<String, String> {
-    let guard = state.session.lock().map_err(|e| e.to_string())?;
-    let s = guard.as_ref().ok_or_else(not_open)?;
-    let _ = &s.source;
-    Ok(s.desc.clone())
+    let guard = state.backend.lock().map_err(|_| not_open())?;
+    let b = guard.as_ref().ok_or_else(not_open)?;
+    Ok(b.desc())
 }

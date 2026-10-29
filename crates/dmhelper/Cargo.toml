@@ -1,0 +1,13 @@
+[package]
+name = "dmhelper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "dmde-rs 只读特权 helper：由 GUI 通过系统授权弹窗拉起，仅提供读操作"
+
+[[bin]]
+name = "dmde-rs-helper"
+path = "src/main.rs"
+
+[dependencies]
+dmrpc = { workspace = true }

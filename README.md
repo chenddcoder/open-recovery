@@ -24,11 +24,78 @@ Rust 核心**零第三方依赖**，命令行与图形界面共用同一套引�
 | NTFS | ✅ 已验证 | 引导扇区、MFT、属性、runlist、`$INDEX_ROOT`、删除记录恢复 |
 | ext2/3/4 | ✅ 已验证 | 超级块、块组、inode、extent 树 + 间接块 |
 | HFS+ / HFSX | ✅ 已验证 | 卷头、catalog B-tree、fork extents |
-| APFS | 🚫 仅识别 | 容器/快照结构复杂，暂不解析 |
+| APFS | 🚧 仅容器识别 | 能认出 APFS 容器；卷/目录/文件解析见下节路线 |
 | 签名雕刻（carving） | ⏳ 规划 | HFS+/APFS 删除后只能靠它 |
 | GUI | ✅ Tauri v2 | 磁盘→分区→目录→预览→导出/恢复 |
+| 提权读取设备 | ✅ macOS | 系统授权窗 → 只读 helper，GUI 本体不以 root 运行 |
 
 "已验证"= 用真实镜像或字节级构造的镜像做过端到端断言（见「测试」一节）。
+
+---
+
+## 权限：GUI 为什么需要一个 helper
+
+macOS 上打开 `/dev/rdisk*` 必须是 root。把整个 App（含 WebView）以 root 重启是最省事也最糟的做法：
+破坏 TCC、窗口服务和用户偏好，还把全部解析代码都放进特权进程。
+
+这里的取舍是**只把"读"交出去**：
+
+```
+GUI (你的身份)  ── Unix socket + token ──▶  dmde-rs-helper (root, 只读)
+   │                                              │
+   └── 写恢复文件（你的身份、你的目录）            └── 列目录 / 预览 / 吐字节
+```
+
+* 点 `/dev/rdisk*` 时如果权限不足，自动弹 **macOS 标准授权窗**（`do shell script ... with administrator privileges`）；
+  取消就报"已取消管理员授权"，不做任何事；
+* helper 的 socket 由 helper `chown` 回当前用户、权限 `0600`，放在 `~/Library/Application Support/dmde-rs/`，
+  其它本地用户连不上；连接必须先 `hello` 带一次性随机 token；
+* helper **没有任何写接口**——恢复出来的文件由 GUI 以你的身份写盘，属主/TCC/权限都正确；
+* helper 空闲 900 秒自动退出并删除 socket；点"管理员权限"按钮也可手动请求，`drop_admin` 立即放弃；
+* helper 日志在 `~/Library/Application Support/dmde-rs/helper.log`。
+
+端口/协议是行式 JSON（`crates/dmrpc`），文件内容用 `chunk…end` 分块流，恒定内存。
+
+---
+
+## APFS：现状与路线（重点）
+
+**现状：只做到"认得出"。** 打开 APFS 卷会明确告诉你还不能列目录，而不是假装挂载成功。
+这不是疏忽，是分层没做完：APFS 不是"超级块 + 目录项"的结构，而是一套**对象化、带事务的 B-tree 系统**。
+
+已经用真实 APFS 镜像（`hdiutil create -fs APFS`）确认的落盘布局（macOS 26 生成的卷）：
+
+| 结构 | 位置 / 要点 |
+|---|---|
+| `NXSB` 容器超级块 | 容器第 0 块；`magic@0x20`、`block_size@0x24`、`block_count@0x28`、`omap_oid@0xa0`、`fs_oid[]@0xb8` |
+| 检查点 | `nx_xp_desc_base/desc_blocks` 指向连续的 NXSB 副本（每 2 块一份） |
+| `omap_phys` | `nx_omap_oid` 是**物理** oid（就是块号）；`om_tree_oid@0x30` 指向 omap B-tree |
+| `btree_node_phys` | 头 0x38；`flags@0x20`（ROOT/LEAF/FIXED_KV）、`level@0x22`、`nkeys@0x24`、`table_space@0x28` |
+| TOC / 键 / 值 | TOC 条目 `{u16 k; u16 v}`；键区起点 = `0x38 + table_space.off + table_space.len`；值从块尾向前放 |
+| `APSB` 卷超级块 | `magic@0x20`、`features@0x28`、`alloc_count@0x58`、`meta_crypto@0x60`（`cpflags&1`=加密）、`omap_oid@0x80`、`root_tree_oid@0x88`、`snap_meta_tree_oid@0x98`、卷名 `@0x2c0`（256 字节） |
+
+在 256 MB 测试卷上实测：容器 4096 B/块、65526 块；`fs_oid=[1026]`；container omap 在第 405 块 →
+tree 在 406 块；**omap 里 `(1026, xid=6) → paddr=404`，第 404 块正是 `APSB`（oid 1026, xid 6）**；
+卷 omap 在 399 块，`(1028, 5) → 392`，第 392 块的对象头 `oid=1028`——即卷的 fs-tree 根。
+也就是说对象映射这条链路已经跑通，剩下的是 fs-tree 的记录解析。
+
+**接下来分三步（按依赖顺序）：**
+
+1. **B-tree 通用层 + 对象映射**：`kvoff` 值偏移规则、Fletcher64 校验、多级节点下降；
+   `oid → paddr`（按 xid 取最新可见版本）。产出：能定位任意卷的 fs-tree 根。
+2. **fs-tree 记录解析**：`j_key`（`obj_id | type`）、`j_drec_key/val`（目录项 + xfields）、
+   `j_inode_val`（大小、时间）、`j_file_extent_val`（逻辑地址 → 物理块，读文件内容）。
+   产出：APFS 卷可以像 FAT/NTFS 一样 `ls / cat / extract`。
+3. **恢复**：APFS 删除会直接抹掉目录记录，按目录项恢复通常没戏——真正的抓手是
+   ① **快照**（`snap_meta_tree`，本地 Time Machine 快照里保留旧 fs-tree，按 xid 读旧版本再 diff）；
+   ② **extent 残留扫描**（已释放但未覆盖的块，按 inode/extent 特征重建）；
+   ③ 最后兜底才是签名雕刻。这三条都要在第 2 步之上做。
+
+**FileVault 加密卷**是另一条独立战线：`meta_crypto.cpflags&1` 为真时，fs-tree 的键值是加密的，
+必须先拿到卷密钥（keybag + AES-XTS 解包）。本版对此只做识别与提示，不做解密；
+实务上可以先在系统里解锁卷再处理其**未加密的容器元数据**，或对硬件加密盘做镜像后离线分析。
+
+---
 
 ---
 
@@ -42,7 +109,8 @@ cargo build --release
 # 图形界面（Tauri v2）
 cd gui/src-tauri
 cargo build --release          # 产物：target/release/dmde-gui
-../../scripts/bundle-macos.sh  # 打成 dist/dmde-rs.app（ad-hoc 签名，双击即用）
+cd ../.. && cargo build --release -p dmhelper   # GUI 提权用的只读 helper
+./scripts/bundle-macos.sh     # 打成 dist/dmde-rs.app（含 helper，ad-hoc 签名，双击即用）
 ```
 
 打包说明：`cargo tauri build` 需要 **tauri-cli v2**。如果本机装的是 v1（`cargo tauri --version` 显示 1.x），

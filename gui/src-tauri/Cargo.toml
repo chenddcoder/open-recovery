@@ -18,3 +18,4 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 dmdisk = { path = "../../crates/dmdisk" }
 dmfs = { path = "../../crates/dmfs" }
+dmrpc = { path = "../../crates/dmrpc" }

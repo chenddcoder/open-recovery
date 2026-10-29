@@ -61,7 +61,8 @@ async function loadDisks() {
 }
 
 async function openSource(path, partition = null) {
-  setStatus(`正在打开 ${path} …`);
+  const needsAdmin = path.startsWith("/dev/");
+  setStatus(needsAdmin ? `正在打开 ${path}，若需要管理员权限会弹出系统授权窗…` : `正在打开 ${path} …`);
   try {
     const src = await invoke("open_source", { path, partition });
     state.source = src;
@@ -69,10 +70,48 @@ async function openSource(path, partition = null) {
     renderPartitions();
     renderVolume(src);
     setStatus(`已挂载 ${src.desc} · ${src.fs_kind}`, "ok");
+    await updateAdmin();
     await navigate("/");
   } catch (e) {
     setStatus(String(e), "error");
+    await updateAdmin();
   }
+}
+
+// ---------------- 权限 ----------------
+
+async function updateAdmin() {
+  const pill = $("priv-pill");
+  try {
+    const st = await invoke("admin_state");
+    if (st.active) {
+      pill.className = "pill admin";
+      pill.textContent = "只读 · 管理员权限";
+      pill.title = "当前会话由只读 helper 提供（root 读、本进程写）";
+    } else if (st.helper) {
+      pill.className = "pill warn";
+      pill.textContent = "只读 · 已获权限（未使用）";
+      pill.title = "helper 在线，但当前卷不需要提权";
+    } else {
+      pill.className = "pill safe";
+      pill.textContent = "只读模式 · 未提权";
+      pill.title = "读取原始磁盘需要管理员权限；helper 只做读";
+    }
+  } catch (_) {
+    pill.className = "pill safe";
+    pill.textContent = "只读模式";
+  }
+}
+
+async function requestAdmin() {
+  setStatus("等待 macOS 授权窗…（密码只用于启动只读 helper，不写任何设备）");
+  try {
+    const msg = await invoke("request_admin");
+    setStatus(msg, "ok");
+  } catch (e) {
+    setStatus(String(e), "error");
+  }
+  await updateAdmin();
 }
 
 function renderPartitions() {
@@ -205,7 +244,7 @@ async function selectEntry(e, row) {
   }
   $("preview-body").textContent = "读取中…";
   try {
-    const p = await invoke("preview", { path: e.path, max: 256 * 1024 });
+    const p = await invoke("preview", { id: e.id, path: e.path, max: 256 * 1024 });
     const head = p.truncated ? `（仅显示前 256 KiB，文件共 ${fmtSize(p.size)}）\n\n` : "";
     $("preview-body").textContent = head + p.text;
   } catch (err) {
@@ -235,7 +274,11 @@ async function saveSelected() {
   if (!state.selected || state.selected.is_dir) return;
   const outDir = $("input-out").value.trim();
   try {
-    const msg = await invoke("save_file", { path: state.selected.path, outDir });
+    const msg = await invoke("save_file", {
+      id: state.selected.id,
+      name: state.selected.name,
+      outDir,
+    });
     setStatus(msg, "ok");
   } catch (e) {
     setStatus(String(e), "error");
@@ -257,6 +300,7 @@ async function recoverAll() {
 // ---------------- 事件绑定 ----------------
 
 $("btn-refresh").onclick = loadDisks;
+$("btn-admin").onclick = requestAdmin;
 $("open-form").onsubmit = (ev) => {
   ev.preventDefault();
   const p = $("input-path").value.trim();
@@ -284,4 +328,5 @@ $("btn-recover").onclick = recoverAll;
     $("input-out").value = "./dmde-rs-recovered";
   }
   await loadDisks();
+  await updateAdmin();
 })();

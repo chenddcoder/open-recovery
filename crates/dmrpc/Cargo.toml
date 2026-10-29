@@ -1,0 +1,12 @@
+[package]
+name = "dmrpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GUI 与只读特权 helper 之间的会话/协议实现（共用同一套解析逻辑）"
+
+[dependencies]
+dmdisk = { workspace = true }
+dmfs = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

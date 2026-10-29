@@ -16,7 +16,8 @@
       </div>
     </div>
     <div class="top-actions">
-      <span class="pill safe">只读模式</span>
+      <span id="priv-pill" class="pill safe" title="读取原始磁盘需要管理员权限；helper 只做读">只读模式 · 未提权</span>
+      <button id="btn-admin" class="ghost">管理员权限</button>
       <button id="btn-refresh" class="ghost">刷新磁盘</button>
     </div>
   </header>
@@ -35,6 +36,7 @@
           <button type="submit">打开</button>
         </form>
         <p class="hint">.dmg 需先 <code>hdiutil convert -format UDRW -o out raw.dmg</code></p>
+        <p class="hint">点物理磁盘时如果权限不足，会弹出 macOS 授权窗（密码只用于启动只读 helper）。</p>
       </section>
 
       <section id="partitions-wrap" class="hidden">
