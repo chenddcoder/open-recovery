@@ -96,13 +96,28 @@ pub fn preview(
 }
 
 #[tauri::command]
-pub fn scan_deleted(
-    state: tauri::State<AppState>,
+pub async fn scan_deleted(
+    state: tauri::State<'_, AppState>,
     limit: Option<usize>,
 ) -> Result<Vec<EntryDto>, String> {
-    let mut guard = state.backend.lock().map_err(|_| not_open())?;
-    let b = guard.as_mut().ok_or_else(not_open)?;
-    b.deleted(limit.unwrap_or(0))
+    // APFS 上这一步要遍历整棵 fs-tree（几千万条），必须离开主线程
+    let mut backend = {
+        let mut g = state.backend.lock().map_err(|_| not_open())?;
+        g.take().ok_or_else(not_open)?
+    };
+    let joined = tauri::async_runtime::spawn_blocking(move || {
+        let r = backend.deleted(limit.unwrap_or(0));
+        (backend, r)
+    })
+    .await;
+    match joined {
+        Ok((b, r)) => {
+            let mut g = state.backend.lock().map_err(|_| not_open())?;
+            *g = Some(b);
+            r
+        }
+        Err(e) => Err(format!("扫描任务异常: {e}")),
+    }
 }
 
 fn unique_path(dir: &Path, name: &str) -> PathBuf {

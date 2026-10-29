@@ -255,16 +255,27 @@ async function selectEntry(e, row) {
 async function scanDeleted() {
   state.mode = "deleted";
   const box = $("entries");
-  box.innerHTML = `<p class="empty">正在扫描 MFT / 目录项，请稍候…</p>`;
+  const kind = (state.source && state.source.fs_kind) || "";
+  const slow = kind === "APFS";
+  box.innerHTML = `<p class="empty">${
+    slow ? "APFS 要遍历整棵目录树（你这盘约 3500 万条记录），可能需要几分钟，请勿关闭窗口…"
+         : "正在扫描目录项，请稍候…"
+  }</p>`;
+  setStatus(slow ? "正在全树扫描（APFS），这一步比较慢…" : "正在扫描…");
   try {
     const items = await invoke("scan_deleted", { limit: 2000 });
     state.entries = items;
     renderEntries(items);
-    setStatus(`扫描完成：${items.length} 个可恢复文件（列表最多显示 2000 个）`, "ok");
+    if (!items.length && slow) {
+      setStatus("没扫到孤儿 inode —— APFS 真删除会连 inode 一起回收，属正常；可先看 .Trashes 或快照", "ok");
+    } else {
+      setStatus(`扫描完成：${items.length} 个可恢复文件（列表最多显示 2000 个）`, "ok");
+    }
   } catch (e) {
-    box.innerHTML = `<p class="empty" style="color:var(--danger)">${e}</p>`;
-    setStatus(String(e), "error");
+    // 出错时不要把人卡在错误页：直接退回浏览模式并重新列目录
     state.mode = "browse";
+    setStatus(String(e), "error");
+    await refresh();
   }
 }
 

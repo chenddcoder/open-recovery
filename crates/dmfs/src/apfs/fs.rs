@@ -478,7 +478,10 @@ impl FileSystem for Apfs {
         super::recover::orphan_scan(self)
     }
 
+    /// APFS 没有"目录项可救"的删除记录，但可以扫**孤儿 inode**
+    /// （有 inode、没有 drec 指向它）。真删时通常连 inode 一起回收，
+    /// 所以返回空是常态 —— 但能扫就返回 true，别直接把用户挡在门外。
     fn supports_deleted(&self) -> bool {
-        false
+        true
     }
 }
