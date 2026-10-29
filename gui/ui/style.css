@@ -216,3 +216,13 @@ button.ghost { background: transparent; }
   max-height: 44px;
   overflow: hidden;
 }
+
+/* 暂停导出：只在进行中出现，红色以示"这是中断操作" */
+button.danger {
+  color: var(--danger);
+  border-color: #4a2626;
+}
+button.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  background: #2a1616;
+}

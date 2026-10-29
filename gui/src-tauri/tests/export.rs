@@ -56,3 +56,77 @@ fn export_single_file_by_path() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+
+/// 暂停：标志已在起点置位时，一个文件都不该写。
+#[test]
+fn export_stops_immediately_when_already_paused() {
+    let Some(img) = image() else { return };
+    let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+
+    let out = std::env::temp_dir().join(format!("dmde-pause-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let msg = dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/sub",
+        out.to_str().unwrap(),
+        &cancel,
+        &mut |_, _| {},
+    )
+    .expect("暂停不是错误，应返回 Ok");
+
+    assert!(msg.starts_with("已暂停"), "应报告已暂停，实际: {msg}");
+    let copied: Vec<_> = std::fs::read_dir(out.join("sub"))
+        .map(|it| it.flatten().collect())
+        .unwrap_or_default();
+    assert!(copied.is_empty(), "暂停后不应写出任何文件：{:?}", copied);
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 暂停后仍能正常再导一次：标志必须在每次开始前被清掉。
+#[test]
+fn export_works_again_after_pause() {
+    let Some(img) = image() else { return };
+    let out = std::env::temp_dir().join(format!("dmde-resume-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+
+    // 第一次：立刻暂停
+    {
+        let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+        let mut b = Backend::Local(s);
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        dmde_gui_lib::commands::do_export_with(
+            &mut b,
+            "/sub",
+            out.to_str().unwrap(),
+            &cancel,
+            &mut |_, _| {},
+        )
+        .unwrap();
+    }
+
+    // 第二次：重新打开、标志复位，应完整导出
+    {
+        let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+        let mut b = Backend::Local(s);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let msg = dmde_gui_lib::commands::do_export_with(
+            &mut b,
+            "/sub",
+            out.to_str().unwrap(),
+            &cancel,
+            &mut |_, _| {},
+        )
+        .unwrap();
+        assert!(msg.starts_with("已导出"), "应正常导出，实际: {msg}");
+    }
+
+    assert!(out.join("sub/deeper/n.txt").exists(), "恢复后应写出完整目录");
+    let _ = std::fs::remove_dir_all(&out);
+}

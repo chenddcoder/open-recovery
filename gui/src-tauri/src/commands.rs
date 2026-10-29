@@ -9,7 +9,9 @@ use crate::{priv_helper, AppState};
 use dmrpc::{open_local, Backend, EntryDto, PreviewDto, RecoverDto, SourceDto};
 use dmfs::sanitize_name;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 fn not_open() -> String {
     "还没有打开任何卷".to_string()
@@ -291,6 +293,8 @@ pub struct ExportStats {
     dirs: u64,
     failed: u64,
     bytes: u64,
+    /// 用户主动暂停时为 true（此时的计数是「暂停前已完成的部分」）
+    cancelled: bool,
 }
 
 /// 导出进度事件（每 ~120ms 最多一帧，避免刷屏拖慢导出本身）。
@@ -302,6 +306,34 @@ pub struct ExportProgress {
     pub bytes: u64,
     pub current: String,
     pub done: bool,
+    pub cancelled: bool,
+}
+
+/// 包一层写盘：每次 `write` 前查一次暂停标志。
+///
+/// 只在「文件之间」检查是不够的——单个十几 GB 的文件要写好几分钟，
+/// 这期间用户点了暂停却毫无反应，体验上就是「停不下来」。
+/// `read_id` / `read_path` 是分块写进来的，所以在文件内部也能立刻中断。
+struct CancelWriter<'a, W: std::io::Write> {
+    inner: W,
+    cancel: &'a AtomicBool,
+}
+
+impl<W: std::io::Write> std::io::Write for CancelWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.cancel.load(Ordering::Relaxed) {
+            // 必须用「不可重试」的错误类型。
+            // std 的 write_all 对 ErrorKind::Interrupted 是**静默重试**的：
+            //     Err(ref e) if e.is_interrupted() => {}   // 继续循环
+            // 用它当暂停信号会让 write_all 无限重试、导出线程永远退不出来
+            // —— 表现就是"点了暂停没反应，也停不下来"。
+            return Err(std::io::Error::other("用户已暂停导出"));
+        }
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn path_base_name(path: &str) -> String {
@@ -314,12 +346,17 @@ fn export_file(
     entry: &EntryDto,
     dest: &Path,
     st: &mut ExportStats,
+    cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) {
+    if cancel.load(Ordering::Relaxed) {
+        st.cancelled = true;
+        return;
+    }
     if let Some(par) = dest.parent() {
         let _ = fs::create_dir_all(par);
     }
-    let mut f = match fs::File::create(dest) {
+    let f = match fs::File::create(dest) {
         Ok(f) => f,
         Err(_) => {
             st.failed += 1;
@@ -328,16 +365,28 @@ fn export_file(
     };
     // 用 id 读：路径可能含非法字符或已变化，id 是会话里的权威句柄。
     // 单文件兜底（id=0）时退回按路径读。
+    let mut w = CancelWriter { inner: f, cancel };
     let r = if entry.id > 0 {
-        b.read_id(entry.id, &mut f)
+        b.read_id(entry.id, &mut w)
     } else {
-        b.read_path(&entry.path, &mut f)
+        b.read_path(&entry.path, &mut w)
     };
+    let _ = w.flush();
+    drop(w);
+
     match r {
         Ok(n) => {
             st.files += 1;
             st.bytes += n;
             on_progress(st, &entry.path);
+        }
+        // 被中断的文件不能冒充完整文件：改名 .partial，
+        // 既保留已恢复的字节，又不至于让人误以为拿到了完整数据。
+        Err(_) if cancel.load(Ordering::Relaxed) => {
+            st.cancelled = true;
+            let mut tmp = dest.as_os_str().to_owned();
+            tmp.push(".partial");
+            let _ = fs::rename(dest, PathBuf::from(tmp));
         }
         Err(_) => st.failed += 1,
     }
@@ -349,11 +398,16 @@ fn export_dir(
     dest: &Path,
     st: &mut ExportStats,
     depth: usize,
+    cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) {
     // 防符号链接自指或异常深目录把栈打爆
     if depth > 64 {
         st.failed += 1;
+        return;
+    }
+    if cancel.load(Ordering::Relaxed) {
+        st.cancelled = true;
         return;
     }
     if fs::create_dir_all(dest).is_err() {
@@ -370,6 +424,12 @@ fn export_dir(
     };
     on_progress(st, src);
     for e in entries {
+        // 每处理一个条目就查一次：目录里几千个文件时，靠递归入口检查
+        // 要等整层遍历完才停，实际可能已经写了几百个文件
+        if cancel.load(Ordering::Relaxed) {
+            st.cancelled = true;
+            return;
+        }
         if e.name == "." || e.name == ".." {
             continue;
         }
@@ -380,11 +440,24 @@ fn export_dir(
         }
         let p = dest.join(&name);
         if e.is_dir {
-            export_dir(b, &e.path, &p, st, depth + 1, on_progress);
+            export_dir(b, &e.path, &p, st, depth + 1, cancel, on_progress);
         } else {
-            export_file(b, &e, &p, st, on_progress);
+            export_file(b, &e, &p, st, cancel, on_progress);
+        }
+        if st.cancelled {
+            return;
         }
     }
+}
+
+/// 暂停正在进行的导出。
+///
+/// 只置一个标志位、不碰 backend：导出线程正独占 backend，
+/// 任何去抢那把锁的写法都会死锁（表现就是「点暂停整个应用卡住」）。
+#[tauri::command]
+pub fn cancel_export(state: tauri::State<AppState>) -> Result<bool, String> {
+    state.export_cancel.store(true, Ordering::SeqCst);
+    Ok(true)
 }
 
 /// 导出当前路径（目录递归或单文件）到 `out_dir`，边导边通过事件上报进度。
@@ -401,11 +474,15 @@ pub async fn export_path(
         g.take().ok_or_else(not_open)?
     };
 
+    // 清掉上一轮可能残留的暂停标志，否则这次一开始就会立刻"暂停"
+    state.export_cancel.store(false, Ordering::SeqCst);
+    let flag = state.export_cancel.clone();
+
     let handle = app.clone();
     let joined = tauri::async_runtime::spawn_blocking(move || {
         let mut b = backend;
         let mut last = std::time::Instant::now();
-        let res = do_export_with(&mut b, &path, &out_dir, &mut |st, cur| {
+        let res = do_export_with(&mut b, &path, &out_dir, &flag, &mut |st, cur| {
             // 节流：导出几万个小文件时，每个都发事件会把 WebView 拖死
             if last.elapsed().as_millis() >= 120 {
                 last = std::time::Instant::now();
@@ -419,22 +496,24 @@ pub async fn export_path(
                         bytes: st.bytes,
                         current: cur.to_string(),
                         done: false,
+                        cancelled: st.cancelled,
                     },
                 );
             }
         });
-        (b, res)
+        let cancelled = flag.load(Ordering::SeqCst);
+        (b, res, cancelled)
     })
     .await;
 
     match joined {
-        Ok((b, res)) => {
+        Ok((b, res, cancelled)) => {
             let mut g = state.backend.lock().map_err(|_| not_open())?;
             *g = Some(b);
             let _ = tauri::Emitter::emit(
                 &app,
                 "export-progress",
-                ExportProgress { done: true, ..Default::default() },
+                ExportProgress { done: true, cancelled, ..Default::default() },
             );
             res
         }
@@ -451,13 +530,14 @@ pub async fn export_path(
 
 /// 导出核心（与 Tauri 解耦，便于直接测试）。
 pub fn do_export(b: &mut Backend, path: &str, out_dir: &str) -> Result<String, String> {
-    do_export_with(b, path, out_dir, &mut |_, _| {})
+    do_export_with(b, path, out_dir, &AtomicBool::new(false), &mut |_, _| {})
 }
 
 pub fn do_export_with(
     b: &mut Backend,
     path: &str,
     out_dir: &str,
+    cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(&ExportStats, &str),
 ) -> Result<String, String> {
     let root = PathBuf::from(out_dir);
@@ -477,6 +557,10 @@ pub fn do_export_with(
         on_progress(&st, path);
         let entries = b.list_dir(path, false)?;
         for e in entries {
+            if cancel.load(Ordering::Relaxed) {
+                st.cancelled = true;
+                break;
+            }
             if e.name == "." || e.name == ".." {
                 continue;
             }
@@ -487,21 +571,85 @@ pub fn do_export_with(
             }
             let p = dest.join(&n);
             if e.is_dir {
-                export_dir(b, &e.path, &p, &mut st, 1, on_progress);
+                export_dir(b, &e.path, &p, &mut st, 1, cancel, on_progress);
             } else {
-                export_file(b, &e, &p, &mut st, on_progress);
+                export_file(b, &e, &p, &mut st, cancel, on_progress);
+            }
+            if st.cancelled {
+                break;
             }
         }
     } else {
-        export_file(b, &entry, &dest, &mut st, on_progress);
+        export_file(b, &entry, &dest, &mut st, cancel, on_progress);
     }
 
+    let tail = if st.cancelled {
+        "；已按你的要求暂停（未写完的文件改名为 .partial）"
+    } else {
+        ""
+    };
     Ok(format!(
-        "已导出到 {}：{} 个文件、{} 个目录、{} 个失败，共 {}",
+        "{} {}：{} 个文件、{} 个目录、{} 个失败，共 {}{}",
+        if st.cancelled { "已暂停导出到" } else { "已导出到" },
         dest.display(),
         st.files,
         st.dirs,
         st.failed,
-        dmdisk::human_size(st.bytes)
+        dmdisk::human_size(st.bytes),
+        tail
     ))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::{CancelWriter, ExportStats};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// 暂停的核心保证：**文件内部**也能中断。
+    ///
+    /// 如果只在文件之间检查，一个 30 GB 的视频要写十几分钟，
+    /// 用户点暂停后毫无反应 —— 这正是"停不下来"的体验来源。
+    #[test]
+    fn cancel_writer_interrupts_mid_file() {
+        eprintln!("[t] 开始");
+        let flag = Arc::new(AtomicBool::new(false));
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut w = CancelWriter { inner: &mut sink, cancel: &flag };
+            use std::io::Write;
+            w.write_all(b"first chunk").unwrap();
+            // 模拟用户在写第一个文件的过程中点了暂停
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            let e = w.write_all(b"second chunk").unwrap_err();
+            // 关键：不能是 Interrupted —— write_all 会把 Interrupted 当"稍后重试"，
+            // 在循环里反复调用 write，暂停就变成了死循环。
+            assert_ne!(
+                e.kind(),
+                std::io::ErrorKind::Interrupted,
+                "暂停信号必须是不可重试的错误，否则 write_all 会无限重试"
+            );
+        }
+        // 暂停前写下的字节保留，暂停后的一个字节都不写
+        assert_eq!(sink, b"first chunk");
+    }
+
+    #[test]
+    fn cancel_writer_passes_through_when_not_cancelled() {
+        let flag = AtomicBool::new(false);
+        let mut sink: Vec<u8> = Vec::new();
+        {
+            let mut w = CancelWriter { inner: &mut sink, cancel: &flag };
+            use std::io::Write;
+            w.write_all(b"hello").unwrap();
+        }
+        assert_eq!(sink, b"hello");
+    }
+
+    /// 统计字段的默认值必须是「未暂停」，否则正常导出会被误报成暂停。
+    #[test]
+    fn export_stats_default_is_not_cancelled() {
+        assert!(!ExportStats::default().cancelled);
+    }
 }

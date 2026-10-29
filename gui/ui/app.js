@@ -334,6 +334,21 @@ async function ensureExportListener() {
   });
 }
 
+// 暂停正在进行的导出：只置后端标志位，导出线程会在下一个分块处退出
+$("btn-cancel-export").onclick = async () => {
+  const b = $("btn-cancel-export");
+  b.disabled = true;
+  b.textContent = "正在暂停…";
+  try {
+    await invoke("cancel_export");
+    setStatus("已请求暂停，正在收尾（当前文件会改名为 .partial）…");
+  } catch (e) {
+    setStatus(String(e), "error");
+    b.disabled = false;
+    b.textContent = "暂停导出";
+  }
+};
+
 // 导出当前浏览的目录（递归）；这是"挑着恢复"的主入口
 $("btn-export").onclick = async () => {
   if (!state.source) {
@@ -349,15 +364,20 @@ $("btn-export").onclick = async () => {
   setStatus(`正在导出 ${p} …`);
   const btn = $("btn-export");
   const up = $("btn-up");
+  const stop = $("btn-cancel-export");
   btn.disabled = true;
   if (up) up.disabled = true;
+  stop.hidden = false;
+  stop.disabled = false;
+  stop.textContent = "暂停导出";
   await ensureExportListener();
   const box = $("export-progress");
   box.hidden = false;
   $("export-progress-text").textContent = "正在准备…";
   try {
     const msg = await invoke("export_path", { path: p, outDir });
-    setStatus(msg, "ok");
+    // 后端会在消息里写明是"已暂停"还是"已导出"，直接透出
+    setStatus(msg, msg.startsWith("已暂停") ? "" : "ok");
   } catch (e) {
     setStatus(String(e), "error");
   } finally {
@@ -365,6 +385,7 @@ $("btn-export").onclick = async () => {
     box.hidden = true;
     btn.disabled = false;
     if (up) up.disabled = false;
+    stop.hidden = true;
   }
 };
 $("btn-admin").onclick = requestAdmin;

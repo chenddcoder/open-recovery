@@ -11,12 +11,19 @@ pub mod commands;
 mod priv_helper;
 
 use dmrpc::Backend;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
 pub struct AppState {
     /// 当前会话：本地进程读 or 特权 helper 读
     pub backend: Mutex<Option<Backend>>,
+    /// 导出暂停标志。
+    ///
+    /// 单独放在这里、而不是塞进 Backend：导出期间 backend 已被 `take()` 走，
+    /// 暂停命令若去抢 `backend` 那把锁，就会一直等到导出结束——
+    /// 表现正是"点了暂停没反应"。
+    pub export_cancel: Arc<AtomicBool>,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -32,6 +39,7 @@ pub fn run() {
             commands::scan_deleted,
             commands::recover_all,
             commands::export_path,
+            commands::cancel_export,
             commands::default_out_dir,
             commands::admin_state,
             commands::request_admin,
