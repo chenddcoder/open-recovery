@@ -288,21 +288,21 @@ function renderEntries(items) {
       <span class="col-size">${e.is_dir ? "-" : fmtSize(e.size)}</span>
       <span class="col-time">${fmtTime(e.mtime)}</span>
       <span class="col-act"></span>`;
-    // 单文件导出的显式入口：每行常驻一个小按钮。
-    // 之前只有一个"随选中项变文案"的主按钮，选了目录就完全看不到单文件入口，
-    // 用户会以为这功能不存在——入口必须一直看得见。
-    if (!e.is_dir) {
-      const act = row.querySelector(".col-act");
-      const b = document.createElement("button");
-      b.className = "mini";
-      b.textContent = "导出";
-      b.title = `只导出这个文件：${e.path}`;
-      b.onclick = (ev) => {
-        ev.stopPropagation(); // 别顺手把整行选中/触发预览
-        runExport([e]);
-      };
-      act.appendChild(b);
-    }
+    // 每行都带「导出」：文件=只导这一个，目录=整棵子树。
+    // 之前只在文件行给按钮，结果用户想单独捞一个子目录（比如 .hdd）时
+    // 在界面上根本找不到入口，以为这个目录"没有被导出"。
+    const act = row.querySelector(".col-act");
+    const b = document.createElement("button");
+    b.className = "mini";
+    b.textContent = "导出";
+    b.title = e.is_dir
+      ? `导出这个目录（含子目录）：${e.path}`
+      : `只导出这个文件：${e.path}`;
+    b.onclick = (ev) => {
+      ev.stopPropagation(); // 别顺手把整行选中/触发预览
+      runExport([e]);
+    };
+    act.appendChild(b);
     row.onclick = (ev) => pickEntry(e, ev);
     row.ondblclick = () => { if (e.is_dir) navigate(e.path); };
     box.appendChild(row);
