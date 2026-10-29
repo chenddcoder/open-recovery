@@ -449,3 +449,146 @@ fn export_selected_items_mixes_files_and_dirs() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// 目标目录里躺着上次失败留下的 0 字节空壳时，即便策略是「跳过已存在」也必须重读。
+///
+/// 这是陈兄那块盘的实测问题：`CentOS Linux-0.hdd/` 里的 `.hds`（整块磁盘镜像）
+/// 被截成 0 字节后，之后每次导出都被当成"已存在"跳过，永远补不上。
+/// 根因是判定只看 `exists()`，不看大小。
+#[test]
+fn export_repairs_empty_shell_even_with_skip() {
+    let Some(img) = image() else {
+        eprintln!("跳过：测试镜像不存在");
+        return;
+    };
+    let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+
+    let out = std::env::temp_dir().join(format!("dmde-repair-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let root = out.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    // 模拟上次导出失败：正式文件名在，但内容是空的
+    std::fs::write(root.join("readme.txt"), b"").unwrap();
+
+    let msg = dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Skip,
+        &dmde_gui_lib::skip::SkipRules::parse(""),
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(root.join("readme.txt")).unwrap(),
+        "apfs hello\n",
+        "0 字节空壳必须被重读覆盖，不能被 Skip 当成已导出"
+    );
+    assert!(
+        !msg.contains("跳过"),
+        "0 字节空壳必须被重读，不能计入跳过: {msg}"
+    );
+    assert!(
+        !root.join("readme.txt.partial").exists(),
+        "成功写完后不该留下 .partial"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// Skip 的边界：0 字节当成残骸重写，但**非空**的大小不符不能动。
+///
+/// 前者必然是失败留下的空壳（空文件没人拿它当资料），后者可能是你自己放的
+/// 同名文件——Skip 的承诺就是"不碰已有文件"，宁可让用户显式换成"覆盖"。
+#[test]
+fn export_skip_repairs_empty_but_keeps_nonempty() {
+    let Some(img) = image() else {
+        eprintln!("跳过：测试镜像不存在");
+        return;
+    };
+    let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+
+    let out = std::env::temp_dir().join(format!("dmde-repair-size-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let root = out.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    // 非空但和源（11 字节）对不上：这是用户的文件，不能覆盖
+    std::fs::write(root.join("readme.txt"), b"apfs").unwrap();
+
+    let msg = dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Skip,
+        &dmde_gui_lib::skip::SkipRules::parse(""),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("readme.txt")).unwrap(),
+        "apfs",
+        "非空的同名文件在 Skip 策略下必须原样保留"
+    );
+    assert!(msg.contains("跳过"), "汇总里要说清跳过了: {msg}");
+
+    // 换成覆盖：这次才把内容补齐
+    dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Overwrite,
+        &dmde_gui_lib::skip::SkipRules::parse(""),
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("readme.txt")).unwrap(),
+        "apfs hello\n",
+        "覆盖策略下才允许改写同名文件"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 目录位置被 0 字节空壳文件占着时，要清掉空壳建目录，而不是整棵跳过。
+#[test]
+fn export_dir_replaces_empty_shell_file() {
+    let Some(img) = image() else {
+        eprintln!("跳过：测试镜像不存在");
+        return;
+    };
+    let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+
+    let out = std::env::temp_dir().join(format!("dmde-dirshell-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    let root = out.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    // sub 本来该是目录，却被失败的那次导出创建成了 0 字节文件
+    std::fs::write(root.join("sub"), b"").unwrap();
+
+    dmde_gui_lib::commands::do_export_with(
+        &mut b,
+        "/",
+        out.to_str().unwrap(),
+        &std::sync::atomic::AtomicBool::new(false),
+        Conflict::Skip,
+        &dmde_gui_lib::skip::SkipRules::parse(""),
+        &mut |_, _| {},
+    )
+    .unwrap();
+
+    assert!(
+        root.join("sub").is_dir(),
+        "空壳文件必须让位给目录，否则整棵子树都导不出来"
+    );
+    assert!(root.join("sub/deeper/n.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&out);
+}

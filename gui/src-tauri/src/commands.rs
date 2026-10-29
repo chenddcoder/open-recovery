@@ -188,7 +188,8 @@ fn dump_to_dir(
 ) -> Result<Option<(PathBuf, u64)>, String> {
     fs::create_dir_all(out_dir).map_err(|e| format!("创建 {out_dir} 失败: {e}"))?;
     let wanted = Path::new(out_dir).join(sanitize_name(name));
-    let target = match resolve_conflict(&wanted, conflict) {
+    // 这里拿不到源文件大小（批量恢复只传 id），交给 exists() 判断
+    let target = match resolve_conflict(&wanted, conflict, None) {
         Some(p) => p,
         None => return Ok(None), // 已存在且策略为跳过
     };
@@ -487,9 +488,33 @@ fn unique_sibling(path: &Path) -> PathBuf {
 }
 
 /// 按策略决定这次实际写到哪里；`None` 表示「跳过」。
-fn resolve_conflict(dest: &Path, mode: Conflict) -> Option<PathBuf> {
-    if !dest.exists() {
-        return Some(dest.to_path_buf());
+/// 目标位置能写吗、该写到哪。
+///
+/// `expect` 是源文件大小（不知道时传 None）。三条规矩：
+///
+/// 1. 同名位置是**目录**时文件写不进去，只能按策略退让。
+/// 2. **0 字节不算"已存在"**。以前写盘是直接 `File::create` 正式名，读盘一失败
+///    就留下 0 字节空壳；而 Skip 只看 `exists()`，于是空壳被当成"已导出"永久跳过。
+///    Parallels 的 `CentOS Linux-0.hdd` 里那个 `.hds`（整块磁盘镜像）就是这么
+///    变成 0 字节、且反复重导都补不上的。空文件不可能是用户的资料，放心重写。
+/// 3. 但**非空且大小不同**时仍然跳过：那可能是你自己放的同名文件，
+///    Skip 的承诺就是"不碰已有的东西"。要强制补齐请把策略换成"覆盖"。
+fn resolve_conflict(dest: &Path, mode: Conflict, expect: Option<u64>) -> Option<PathBuf> {
+    let meta = match fs::symlink_metadata(dest) {
+        Ok(m) => m,
+        // 不存在（或父目录都还没有）就是要写的位置
+        Err(_) => return Some(dest.to_path_buf()),
+    };
+    if meta.is_dir() {
+        return match mode {
+            Conflict::Rename => Some(unique_sibling(dest)),
+            _ => None,
+        };
+    }
+    if let Some(want) = expect {
+        if want > 0 && meta.len() == 0 {
+            return Some(dest.to_path_buf());
+        }
     }
     match mode {
         Conflict::Skip => None,
@@ -571,11 +596,16 @@ fn export_file(
         st.cancelled = true;
         return;
     }
-    // 同名策略在这里生效：Skip 直接返回，连源都不读（几万个文件时快很多）
-    let actual = match resolve_conflict(dest, conflict) {
+    // 同名策略在这里生效：Skip 且目标已完整时直接返回，连源都不读（几万个文件时快很多）。
+    // 已存在但大小对不上，说明是上次失败留下的残骸，必须重读，不能算"已导出"。
+    let actual = match resolve_conflict(dest, conflict, Some(entry.size)) {
         Some(p) => p,
         None => {
             st.skipped += 1;
+            // 正式文件是完整的，暂停留下的 .partial 就是过时垃圾，顺手清掉
+            let mut stale = dest.as_os_str().to_owned();
+            stale.push(".partial");
+            let _ = fs::remove_file(PathBuf::from(stale));
             return;
         }
     };
@@ -583,7 +613,18 @@ fn export_file(
     if let Some(par) = dest.parent() {
         let _ = fs::create_dir_all(par);
     }
-    let f = match fs::File::create(dest) {
+
+    // 先写 `<名字>.partial`，整份读完才改名到正式名。
+    //
+    // 这样"正式名存在 == 内容完整"才有保证：中途读盘失败、本地盘满、用户暂停，
+    // 都只会在 .partial 上留下半截，不会把正式文件截成 0 字节。
+    // 以前直接 create 正式名，一次失败就把好文件变成空壳，而 Skip 又只看 exists()，
+    // 于是那块盘上 Parallels 的 .hds 永远导不出来。
+    let mut part = dest.as_os_str().to_owned();
+    part.push(".partial");
+    let part = PathBuf::from(part);
+
+    let f = match fs::File::create(&part) {
         Ok(f) => f,
         Err(_) => {
             st.failed += 1;
@@ -602,26 +643,19 @@ fn export_file(
     drop(w);
 
     match r {
-        Ok(n) => {
-            st.files += 1;
-            st.bytes += n;
-            // 上一轮暂停留下的 .partial 已经过时了，留着只会让人分不清哪个是好的
-            let mut stale = dest.as_os_str().to_owned();
-            stale.push(".partial");
-            let stale = PathBuf::from(stale);
-            if stale.exists() {
-                let _ = fs::remove_file(&stale);
+        Ok(n) => match fs::rename(&part, dest) {
+            Ok(()) => {
+                st.files += 1;
+                st.bytes += n;
+                on_progress(st, &entry.path);
             }
-            on_progress(st, &entry.path);
-        }
-        // 被中断的文件不能冒充完整文件：改名 .partial，
-        // 既保留已恢复的字节，又不至于让人误以为拿到了完整数据。
-        Err(_) if cancel.load(Ordering::Relaxed) => {
-            st.cancelled = true;
-            let mut tmp = dest.as_os_str().to_owned();
-            tmp.push(".partial");
-            let _ = fs::rename(dest, PathBuf::from(tmp));
-        }
+            // 改名失败（目标被占用、跨卷等）算失败，但 .partial 里是完整数据，
+            // 留在原地比删掉强
+            Err(_) => st.failed += 1,
+        },
+        // 被中断：文件本来就叫 .partial，不用改名，保留已恢复的字节
+        Err(_) if cancel.load(Ordering::Relaxed) => st.cancelled = true,
+        // 读盘失败：同样只留 .partial，正式名不会出现半个文件
         Err(_) => st.failed += 1,
     }
 }
@@ -650,7 +684,10 @@ fn export_dir(
     // 目录已存在是正常的（增量导出、重复导出），直接复用；
     // 但如果同名位置是个**文件**，就得按策略处理——
     // 注意 Overwrite 也不删它：为了建目录而删掉你的文件，代价太大。
-    let actual = if dest.exists() && !dest.is_dir() {
+    // 唯一例外是 0 字节的空壳：那是之前某次失败留下的垃圾，里面没有任何数据，
+    // 挡着一整棵目录不导才是真的坑（.hdd 这类 bundle 目录最容易被它卡住）。
+    let empty_shell = dest.symlink_metadata().map(|m| !m.is_dir() && m.len() == 0).unwrap_or(false);
+    let actual = if dest.exists() && !dest.is_dir() && !empty_shell {
         match conflict {
             Conflict::Skip => {
                 st.skipped += 1;
@@ -667,6 +704,10 @@ fn export_dir(
     };
     let dest = actual.as_path();
 
+    // 0 字节空壳占着目录的位置，先清掉才能建目录
+    if empty_shell {
+        let _ = fs::remove_file(dest);
+    }
     if fs::create_dir_all(dest).is_err() {
         st.failed += 1;
         return;
