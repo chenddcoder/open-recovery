@@ -7,7 +7,7 @@
 //! `priv_helper` 管提权：macOS 读 `/dev/rdisk*` 必须 root，但 GUI 不该整体以
 //! root 跑（WebView + TCC 都会出问题），所以只把"读"交给一个只读 helper。
 
-mod commands;
+pub mod commands;
 mod priv_helper;
 
 use dmrpc::Backend;
@@ -30,6 +30,7 @@ pub fn run() {
             commands::save_file,
             commands::scan_deleted,
             commands::recover_all,
+            commands::export_path,
             commands::default_out_dir,
             commands::admin_state,
             commands::request_admin,

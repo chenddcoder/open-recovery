@@ -85,6 +85,15 @@ impl Client {
         }
     }
 
+    pub fn stat(&mut self, path: &str) -> Result<Option<EntryDto>, String> {
+        match self.call(&Request::Stat { path: path.to_string() }) {
+            Ok(Reply::Entry { entry }) => Ok(entry),
+            Ok(Reply::Error { message }) => Err(message),
+            Ok(other) => Err(unexpected(&other).to_string()),
+            Err(e) => Err(format!("连接 helper 失败: {e}")),
+        }
+    }
+
     pub fn deleted(&mut self, limit: usize) -> Result<Vec<EntryDto>, String> {
         match self.call(&Request::Deleted { limit }) {
             Ok(Reply::Entries { entries }) => Ok(entries),

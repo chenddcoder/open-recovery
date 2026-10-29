@@ -300,6 +300,30 @@ async function recoverAll() {
 // ---------------- 事件绑定 ----------------
 
 $("btn-refresh").onclick = loadDisks;
+
+// 导出当前浏览的目录（递归）；这是"挑着恢复"的主入口
+$("btn-export").onclick = async () => {
+  if (!state.source) {
+    setStatus("先打开一个源", "error");
+    return;
+  }
+  const outDir = ($("input-out").value || "").trim() || state.outDir;
+  if (!outDir) {
+    setStatus("请先填写输出目录", "error");
+    return;
+  }
+  const p = state.path || "/";
+  setStatus(`正在导出 ${p} …（目录大时可能需要几分钟，请勿关闭窗口）`);
+  $("btn-export").disabled = true;
+  try {
+    const msg = await invoke("export_path", { path: p, outDir });
+    setStatus(msg, "ok");
+  } catch (e) {
+    setStatus(String(e), "error");
+  } finally {
+    $("btn-export").disabled = false;
+  }
+};
 $("btn-admin").onclick = requestAdmin;
 $("open-form").onsubmit = (ev) => {
   ev.preventDefault();

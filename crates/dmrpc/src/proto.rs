@@ -17,6 +17,7 @@ pub enum Request {
     Disks,
     Open { source: String, partition: Option<usize> },
     Ls { path: String, show_deleted: bool },
+    Stat { path: String },
     Preview { path: String, max: usize },
     PreviewId { id: u64, max: usize },
     Deleted { limit: usize },
@@ -35,6 +36,7 @@ pub enum Reply {
     Disks { disks: Vec<DiskDto> },
     Source { source: SourceDto },
     Entries { entries: Vec<EntryDto> },
+    Entry { entry: Option<EntryDto> },
     Preview { preview: PreviewDto },
     /// 后跟 `len` 字节原始数据
     Chunk { len: u64 },

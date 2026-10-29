@@ -61,6 +61,22 @@ impl Backend {
             Backend::Remote(c) => c.read_id(id, out),
         }
     }
+
+    /// 取条目信息（文件 or 目录）。
+    pub fn stat(&mut self, path: &str) -> Result<Option<EntryDto>, String> {
+        match self {
+            Backend::Local(s) => s.stat(path),
+            Backend::Remote(c) => c.stat(path),
+        }
+    }
+
+    /// 按路径读文件内容（已删除项没有可信路径时请用 `read_id`）。
+    pub fn read_path(&mut self, path: &str, out: &mut dyn Write) -> Result<u64, String> {
+        match self {
+            Backend::Local(s) => s.read_path(path, out),
+            Backend::Remote(c) => c.read_path(path, out),
+        }
+    }
 }
 
 /// 先在本地打开；只有"权限不足"才值得升级到提权路径。

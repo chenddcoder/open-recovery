@@ -4,7 +4,7 @@
 //! 提权只是把 `AnyFs` 放在另一个进程里，解析逻辑一行都没有分叉。
 
 use dmdisk::{human_size, Source};
-use dmfs::{resolve, AnyFs, Entry, FileSystem, FsKind};
+use dmfs::{probe_partition, resolve, AnyFs, Entry, FileSystem, FsKind};
 use std::collections::HashMap;
 use std::io::Write;
 
@@ -56,6 +56,24 @@ impl Session {
         out.sort_by_key(|e| (!e.is_dir(), e.name.to_lowercase()));
         let base = if path.is_empty() { "/" } else { path };
         Ok(out.iter().map(|e| to_dto(base, e)).collect())
+    }
+
+    /// 取单个条目的信息（判断是文件还是目录）。路径不存在返回 `Ok(None)`。
+    ///
+    /// 顺手把条目放进缓存：紧接着的 `read_id` 依赖它，否则会报"条目已失效"
+    /// （症状是导出的文件存在但内容为空）。
+    pub fn stat(&mut self, path: &str) -> Result<Option<EntryDto>, String> {
+        let e = resolve(&self.fs, path).map_err(|e| e.to_string())?;
+        Ok(match e {
+            Some(e) => {
+                let id = e.id.0;
+                let mut d = to_dto("", &e);
+                d.path = path.to_string();
+                self.cache.insert(id, e);
+                Some(d)
+            }
+            None => None,
+        })
     }
 
     pub fn preview(&self, path: &str, max: usize) -> Result<PreviewDto, String> {
@@ -148,7 +166,7 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
 
     let mut partitions = Vec::new();
     for p in &table.partitions {
-        let kind = dmfs::probe(&src.volume(p.offset, p.size));
+        let kind = probe_partition(&src.volume(p.offset, p.size));
         partitions.push(PartDto {
             index: p.index,
             type_name: p.type_name.clone(),
@@ -172,32 +190,42 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
             if dmfs::probe(&src.reader) != FsKind::Unknown {
                 (src.reader.slice(0, src.size), source.to_string())
             } else {
-                let cands: Vec<_> = table
+                // 自动挑"最像数据分区"的那个，而不是一上来就让用户做选择题：
+                // 一块 Mac 盘通常是 [EFI 200MB(FAT32)] + [APFS 1.8TB]，
+                // 让人在两者之间选毫无意义。
+                let mut cands: Vec<(&dmdisk::Partition, FsKind)> = table
                     .partitions
                     .iter()
-                    .filter(|p| dmfs::probe(&src.volume(p.offset, p.size)) != FsKind::Unknown)
+                    .filter_map(|p| {
+                        let k = probe_partition(&src.volume(p.offset, p.size));
+                        if k == FsKind::Unknown {
+                            None
+                        } else {
+                            Some((p, k))
+                        }
+                    })
+                    // EFI 系统分区只放引导文件，绝不该是"恢复目标"
+                    .filter(|(p, _)| {
+                        !(p.type_name.to_ascii_lowercase().contains("efi") && p.size < 4 << 30)
+                    })
                     .collect();
-                match cands.len() {
-                    0 => {
-                        return Err(OpenError::plain(format!(
-                            "{source} 上没有可挂载的文件系统（分区表 {}）",
-                            table.scheme.as_str()
-                        )))
-                    }
-                    1 => {
-                        let p = cands[0];
-                        (
-                            src.volume(p.offset, p.size),
-                            format!("{source} 分区{}（{}）", p.index, p.type_name),
-                        )
-                    }
-                    _ => {
-                        return Err(OpenError::plain(format!(
-                            "该源有多个可挂载分区，请先选择分区（共 {} 个）",
-                            cands.len()
-                        )))
-                    }
+                // APFS 优先，其余按体积降序（数据分区总是最大的那个）
+                cands.sort_by(|a, b| {
+                    let ka = (a.1 == FsKind::Apfs) as u8;
+                    let kb = (b.1 == FsKind::Apfs) as u8;
+                    kb.cmp(&ka).then_with(|| b.0.size.cmp(&a.0.size))
+                });
+                if cands.is_empty() {
+                    return Err(OpenError::plain(format!(
+                        "{source} 上没有可挂载的文件系统（分区表 {}）",
+                        table.scheme.as_str()
+                    )));
                 }
+                let (p, _k) = cands[0];
+                (
+                    src.volume(p.offset, p.size),
+                    format!("{source} 分区{}（{}）", p.index, p.type_name),
+                )
             }
         }
     };
@@ -205,7 +233,7 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
     // APFS 是容器套卷：真机上卷 0 常常是 Preboot/System，恢复要的却是 Data 卷。
     // 这里自动挑「角色含 Data 的卷」，挑不到再退回 0，并把卷名写进描述。
     let mut desc = desc;
-    let fs = if dmfs::probe(&reader) == FsKind::Apfs {
+    let fs = if probe_partition(&reader) == FsKind::Apfs {
         let idx = pick_apfs_volume(&reader);
         let fs = AnyFs::open_volume(reader, idx).map_err(OpenError::from)?;
         desc = format!("{desc} · 卷「{}」", fs.info().label);
@@ -234,17 +262,30 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
 
 /// 选一个适合浏览/恢复的 APFS 卷：优先角色含 Data（0x2）的，否则第 0 个。
 fn pick_apfs_volume(reader: &dmdisk::Reader) -> usize {
-    const ROLE_DATA: u16 = 0x0002;
-    match dmfs::apfs::volumes(reader) {
-        Ok((_, vols)) => vols
-            .iter()
-            .find_map(|(i, v)| match v {
-                Ok(v) if v.role & ROLE_DATA != 0 => Some(*i),
-                _ => None,
-            })
-            .unwrap_or(0),
-        Err(_) => 0,
+    // 0x40 = DATA（macOS 10.15+ 的 "- Data" 卷），0x2 = USER（更早的写法）
+    const ROLE_DATA: u16 = 0x0040;
+    const ROLE_USER: u16 = 0x0002;
+    let vols = match dmfs::apfs::volumes(reader) {
+        Ok((_, v)) => v,
+        Err(_) => return 0,
+    };
+    // 1) 角色位
+    for (i, v) in &vols {
+        if let Ok(v) = v {
+            if v.role & (ROLE_DATA | ROLE_USER) != 0 {
+                return *i;
+            }
+        }
     }
+    // 2) 名字里带 Data（有些盘的角色位不规范，但卷名可靠）
+    for (i, v) in &vols {
+        if let Ok(v) = v {
+            if v.name.to_ascii_lowercase().contains("data") {
+                return *i;
+            }
+        }
+    }
+    0
 }
 
 fn to_dto(base: &str, e: &Entry) -> EntryDto {

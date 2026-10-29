@@ -119,6 +119,82 @@ GUI (你的身份)  ── Unix socket + token ──▶  dmde-rs-helper (root, 
 
 ---
 
+## 实战：一块 2 TB Mac 盘的分区"消失"了
+
+这不是构造出来的案例，是真实救回来的一块 WD 移动硬盘（`/dev/rdisk4`，RTL9210B 桥接）。
+
+### 现象
+
+```
+diskutil list
+/dev/disk4 (external, physical):
+   0:      GUID_partition_scheme                        *2.0 TB     disk4
+```
+
+`diskutil` 只显示分区表，**一个分区都不列**，`/dev/disk4s1`、`disk4s2` 设备节点根本不存在，
+系统里既看不到盘也挂不动。表面看像"分区表被抹了"。
+
+### 实际诊断（`scripts/probe-disk.py`）
+
+直接按字节读，结论和表面完全相反：
+
+| 检查项 | 结果 |
+|---|---|
+| 保护性 MBR | 正常（类型 0xEE） |
+| GPT 主头 CRC32 | **通过**（`存储 0x86fc13ae = 计算 0x86fc13ae`）|
+| GPT 备份头 CRC32 | **通过** |
+| 分区条目 | **2 条都在**：`EFI 200MB` + `Apple APFS 1.82TB`（LBA 409640..3907029127）|
+| APFS 容器块 0 | **被随机字节覆盖**（正常应是 `NXSB`）|
+| 检查点副本 | 块 2、4、6…280 共 140+ 份，**全部校验通过** |
+
+也就是说：分区表没丢，数据没丢，**只是容器块 0 被打坏了**，而系统在分区扫描阶段就放弃，
+连设备节点都不建 —— 于是看起来"整块盘没了"。
+
+### 修好的三个深层 bug
+
+这三处都是小镜像碰巧能跑、真盘一上就彻底读不出的类型：
+
+1. **omap 键不能按字节比**。`omap_key_t` 是 `{u64 oid; u64 xid}` 小端，
+   字节序比较会把 `oid=1051`（字节 `1b 04`）判成**大于** `oid=178945`（`01 bb 02`），
+   起始键一跳过就报"omap 里找不到对象"。
+2. **fs-tree 的 `j_key` 排序语义是"先 obj_id 再 type"**。它是 `(type<<60)|obj_id` 的小端 u64，
+   用字节序比较时，obj_id 一旦跨过 256 / 65536 的进位边界就整棵树错位。
+   症状极具迷惑性：**根目录能正常列出，所有子目录却都显示"空目录"**。
+3. **索引节点（level>0）的值固定 8 字节**（子节点 oid），不能按叶子的 `val_size`(16) 取，
+   否则值区顶出块外 8 字节，报「第 0 项值越界（4048..4064）」。
+
+修完之后同一块盘：
+
+```
+open  : /dev/rdisk4 分区2（Apple APFS） · 卷「WD - Data」   (0.9s)
+卷标  : WD - Data        容量 1.82 TiB
+fs-tree: 35,721,962 条键 / 953,023 个节点（树高 4）
+/Users/chendd          : 80 项
+/Users/chendd/Documents: games, huan, learn, self, whisky, 图片 …
+```
+
+`cat .gitconfig` 读出的内容与原文逐字节一致，导出到本机也验证通过。
+
+### 这类盘怎么救（操作顺序）
+
+```bash
+# 1) 只读诊断，确认分区表与文件系统头还在
+sudo python3 scripts/probe-disk.py /dev/rdisk4
+
+# 2) 直接按偏移打开 APFS 分区（分区表在，但系统不认的情况）
+./target/release/dmde-rs ls /dev/rdisk4 /Users \
+    --offset 209735680 --size 2000189177856
+
+# 3) 挑目录导出
+./target/release/dmde-rs extract /dev/rdisk4 /Users/chendd/Documents \
+    --offset 209735680 --size 2000189177856 -o /Volumes/目标盘/rescued
+```
+
+GUI 里更简单：点这块盘 → 自动跳过 EFI、选中 APFS 分区和 `- Data` 卷 → 浏览目录 →
+「导出当前目录（含子目录）」。全程只读，不需要修分区表，也不写原盘。
+
+---
+
 ## 构建
 
 ```bash

@@ -227,3 +227,156 @@ pub fn current_source(state: tauri::State<AppState>) -> Result<String, String> {
     let b = guard.as_ref().ok_or_else(not_open)?;
     Ok(b.desc())
 }
+
+// ---------------------------------------------------------------------------
+// 导出（"挑着恢复"的核心）：把一个目录或单个文件写到本地磁盘。
+// 读字节始终由只读后端完成，写盘始终以用户身份进行，权限不混。
+// ---------------------------------------------------------------------------
+
+#[derive(Default)]
+struct ExportStats {
+    files: u64,
+    dirs: u64,
+    failed: u64,
+    bytes: u64,
+}
+
+fn path_base_name(path: &str) -> String {
+    let t = path.trim_end_matches('/');
+    t.rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or("root").to_string()
+}
+
+fn export_file(
+    b: &mut Backend,
+    entry: &EntryDto,
+    dest: &Path,
+    st: &mut ExportStats,
+) {
+    if let Some(par) = dest.parent() {
+        let _ = fs::create_dir_all(par);
+    }
+    let mut f = match fs::File::create(dest) {
+        Ok(f) => f,
+        Err(_) => {
+            st.failed += 1;
+            return;
+        }
+    };
+    // 用 id 读：路径可能含非法字符或已变化，id 是会话里的权威句柄。
+    // 单文件兜底（id=0）时退回按路径读。
+    let r = if entry.id > 0 {
+        b.read_id(entry.id, &mut f)
+    } else {
+        b.read_path(&entry.path, &mut f)
+    };
+    match r {
+        Ok(n) => {
+            st.files += 1;
+            st.bytes += n;
+        }
+        Err(_) => st.failed += 1,
+    }
+}
+
+fn export_dir(
+    b: &mut Backend,
+    src: &str,
+    dest: &Path,
+    st: &mut ExportStats,
+    depth: usize,
+) {
+    // 防符号链接自指或异常深目录把栈打爆
+    if depth > 64 {
+        st.failed += 1;
+        return;
+    }
+    if fs::create_dir_all(dest).is_err() {
+        st.failed += 1;
+        return;
+    }
+    st.dirs += 1;
+    let entries = match b.list_dir(src, false) {
+        Ok(v) => v,
+        Err(_) => {
+            st.failed += 1;
+            return;
+        }
+    };
+    for e in entries {
+        if e.name == "." || e.name == ".." {
+            continue;
+        }
+        let name = sanitize_name(&e.name);
+        if name.is_empty() {
+            st.failed += 1;
+            continue;
+        }
+        let p = dest.join(&name);
+        if e.is_dir {
+            export_dir(b, &e.path, &p, st, depth + 1);
+        } else {
+            export_file(b, &e, &p, st);
+        }
+    }
+}
+
+/// 导出当前路径（目录递归或单文件）到 `out_dir`，保持原有目录结构。
+#[tauri::command]
+pub fn export_path(
+    state: tauri::State<AppState>,
+    path: String,
+    out_dir: String,
+) -> Result<String, String> {
+    let mut guard = state.backend.lock().map_err(|_| not_open())?;
+    let b = guard.as_mut().ok_or_else(not_open)?;
+    do_export(b, &path, &out_dir)
+}
+
+/// 导出核心（与 Tauri 解耦，便于直接测试）。
+pub fn do_export(b: &mut Backend, path: &str, out_dir: &str) -> Result<String, String> {
+    let root = PathBuf::from(out_dir);
+    fs::create_dir_all(&root).map_err(|e| format!("无法创建输出目录 {out_dir}: {e}"))?;
+
+    // 必须先 stat：`list_dir` 对普通文件也会返回空列表，
+    // 靠"列不出东西"猜类型会把文件当空目录建出来。
+    let entry = b
+        .stat(path)?
+        .ok_or_else(|| format!("路径不存在: {path}"))?;
+
+    let name = sanitize_name(&path_base_name(path));
+    let dest = root.join(&name);
+    let mut st = ExportStats::default();
+
+    if entry.is_dir {
+        fs::create_dir_all(&dest).map_err(|e| format!("创建 {} 失败: {e}", dest.display()))?;
+        st.dirs += 1;
+        let entries = b.list_dir(path, false)?;
+        for e in entries {
+            if e.name == "." || e.name == ".." {
+                continue;
+            }
+            let n = sanitize_name(&e.name);
+            if n.is_empty() {
+                st.failed += 1;
+                continue;
+            }
+            let p = dest.join(&n);
+            if e.is_dir {
+                export_dir(b, &e.path, &p, &mut st, 1);
+            } else {
+                export_file(b, &e, &p, &mut st);
+            }
+        }
+    } else {
+        export_file(b, &entry, &dest, &mut st);
+    }
+
+    Ok(format!(
+        "已导出到 {}：{} 个文件、{} 个目录、{} 个失败，共 {}",
+        dest.display(),
+        st.files,
+        st.dirs,
+        st.failed,
+        dmdisk::human_size(st.bytes)
+    ))
+}
