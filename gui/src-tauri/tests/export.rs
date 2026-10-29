@@ -300,3 +300,89 @@ fn export_skips_dirs_matching_rules() {
 
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// 单文件导出（按会话 id）：界面上选中一个文件后点「导出」走的就是这条。
+///
+/// 与按路径导出的关键差别：这条不依赖路径能解析，所以勾了「显示已删除」
+/// 之后选中的条目（目录里已经查不到）也能导出。
+#[test]
+fn export_single_file_by_id() {
+    use dmde_gui_lib::commands::{do_export_entry, Conflict};
+    use std::sync::atomic::AtomicBool;
+
+    let Some(img) = image() else {
+        eprintln!("跳过：测试镜像不存在");
+        return;
+    };
+    let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+
+    let items = b.list_dir("/", false).expect("列根目录");
+    let e = items
+        .iter()
+        .find(|e| e.name == "readme.txt")
+        .expect("镜像根目录里应有 readme.txt");
+    assert!(e.id > 0, "list_dir 必须带回会话 id，否则按 id 导出无从谈起");
+
+    let out = std::env::temp_dir().join(format!("dmde-export-id-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+
+    let (st, dest) = do_export_entry(
+        &mut b,
+        e.id,
+        &e.name,
+        out.to_str().unwrap(),
+        &AtomicBool::new(false),
+        Conflict::Skip,
+        &mut |_, _| {},
+    )
+    .expect("按 id 导出应成功");
+
+    assert_eq!(st.files, 1, "只该导这一个文件");
+    assert_eq!(st.bytes, "apfs hello\n".len() as u64);
+    assert_eq!(dest.file_name().unwrap(), "readme.txt");
+    assert_eq!(std::fs::read_to_string(&dest).unwrap(), "apfs hello\n");
+
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// 目标已存在 + 跳过策略：不能覆盖，也不能报成失败。
+#[test]
+fn export_single_file_respects_conflict() {
+    use dmde_gui_lib::commands::{do_export_entry, Conflict};
+    use std::sync::atomic::AtomicBool;
+
+    let Some(img) = image() else {
+        return;
+    };
+    let (s, _) = dmrpc::open_local(img, None).expect("打开镜像");
+    let mut b = Backend::Local(s);
+    let items = b.list_dir("/", false).expect("列根目录");
+    let e = items.iter().find(|e| e.name == "readme.txt").unwrap();
+
+    let out = std::env::temp_dir().join(format!("dmde-export-id-cf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("readme.txt"), "原有的内容，别动").unwrap();
+
+    let (st, _) = do_export_entry(
+        &mut b,
+        e.id,
+        &e.name,
+        out.to_str().unwrap(),
+        &AtomicBool::new(false),
+        Conflict::Skip,
+        &mut |_, _| {},
+    )
+    .expect("跳过不是错误");
+
+    assert_eq!(st.skipped, 1);
+    assert_eq!(st.files, 0);
+    assert_eq!(
+        std::fs::read_to_string(out.join("readme.txt")).unwrap(),
+        "原有的内容，别动",
+        "Skip 策略绝不能动目标目录里的旧文件"
+    );
+
+    let _ = std::fs::remove_dir_all(&out);
+}

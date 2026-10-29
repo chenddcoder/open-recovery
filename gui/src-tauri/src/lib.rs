@@ -43,7 +43,7 @@ pub fn run() {
             commands::open_source,
             commands::list_dir,
             commands::preview,
-            commands::save_file,
+            commands::export_entry,
             commands::scan_deleted,
             commands::recover_all,
             commands::export_path,

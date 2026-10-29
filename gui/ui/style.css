@@ -181,6 +181,9 @@ button.ghost { background: transparent; }
   white-space: pre-wrap; word-break: break-word; user-select: text;
 }
 .preview-actions { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
+/* 按钮文案会带上文件名（可能几十个字符），撑高按钮不好看；
+   截断显示，完整路径放 title 里 */
+.preview-actions button { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .field { display: flex; flex-direction: column; gap: 4px; font-size: 11px; color: var(--text-dim); }
 
 /* ---------- 状态栏 ---------- */

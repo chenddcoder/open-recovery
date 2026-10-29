@@ -175,13 +175,43 @@ function renderVolume(src) {
 
 async function navigate(path) {
   state.path = path;
-  state.selected = null;
+  clearSelection();
   renderCrumbs();
   await refresh();
 }
 
+function clearSelection() {
+  state.selected = null;
+  document.querySelectorAll(".row.selected").forEach((r) => r.classList.remove("selected"));
+  $("preview-meta").textContent = "未选择文件";
+  $("preview-body").textContent = "";
+  updateExportTarget();
+}
+
+/// 一个「导出」按钮，按选中项决定导什么。之前只有「导出当前目录」，
+/// 想单独捞一个文件只能点「保存选中文件」——而那条路是同步读写，
+/// 几 GB 的文件会把窗口卡死，也不支持暂停。现在统一成一个入口。
+function updateExportTarget() {
+  const b = $("btn-export");
+  if (!b) return;
+  const sel = state.selected;
+  if (sel && sel.is_dir) {
+    b.textContent = "导出选中目录（含子目录）";
+    b.title = `${sel.path} → 整棵子树`;
+  } else if (sel) {
+    b.textContent = `导出选中文件：${sel.name}`;
+    b.title = `${sel.path} → 只导这一个文件`;
+  } else {
+    b.textContent = "导出当前目录（含子目录）";
+    b.title = `${state.path} → 整棵子树`;
+  }
+}
+
 async function refresh() {
   const box = $("entries");
+  // 列表要重建，之前的行元素会消失；选中状态跟着作废，
+  // 否则按钮还停在"导出选中文件：xxx"上，实际那个文件已经不在列表里了。
+  clearSelection();
   box.innerHTML = `<p class="empty">读取中…</p>`;
   try {
     const items = await invoke("list_dir", {
@@ -259,7 +289,7 @@ async function selectEntry(e, row) {
   document.querySelectorAll(".row.selected").forEach((r) => r.classList.remove("selected"));
   row?.classList.add("selected");
   state.selected = e;
-  $("btn-save").disabled = e.is_dir;
+  updateExportTarget();
   $("preview-meta").textContent = `${e.path} · ${e.is_dir ? "目录" : fmtSize(e.size)}`;
   if (e.is_dir) {
     $("preview-body").textContent = "目录：双击进入";
@@ -276,23 +306,6 @@ async function selectEntry(e, row) {
 }
 
 // ---------------- 动作 ----------------
-
-async function saveSelected() {
-  if (!state.selected || state.selected.is_dir) return;
-  const outDir = $("input-out").value.trim();
-  try {
-    const sel = $("sel-conflict");
-    const msg = await invoke("save_file", {
-      id: state.selected.id,
-      name: state.selected.name,
-      outDir,
-      onConflict: sel ? sel.value : "skip",
-    });
-    setStatus(msg, "ok");
-  } catch (e) {
-    setStatus(String(e), "error");
-  }
-}
 
 async function recoverAll() {
   if (!state.source) { setStatus("先打开一个源", "error"); return; }
@@ -371,8 +384,12 @@ $("btn-export").onclick = async () => {
       localStorage.setItem("dmde.skipRules", skipRules);
     } catch (_) {}
   }
-  const p = state.path || "/";
-  setStatus(`正在导出 ${p} …`);
+  // 选中文件 → 只导这一个（按 id 读，已删除条目也能导出；不套跳过规则）；
+  // 选中目录 / 未选中 → 走整棵子树导出（有遍历、有跳过规则）
+  const picked = state.selected;
+  const single = picked && !picked.is_dir ? picked : null;
+  const p = single ? single.path : (picked && picked.is_dir ? picked.path : state.path || "/");
+  setStatus(single ? `正在导出文件 ${p} …` : `正在导出 ${p} …`);
   const btn = $("btn-export");
   const up = $("btn-up");
   const stop = $("btn-cancel-export");
@@ -387,7 +404,14 @@ $("btn-export").onclick = async () => {
   box.hidden = false;
   $("export-progress-text").textContent = "正在准备…";
   try {
-    const msg = await invoke("export_path", { path: p, outDir, onConflict, skipRules });
+    const msg = single
+      ? await invoke("export_entry", {
+          id: single.id,
+          name: single.name,
+          outDir,
+          onConflict,
+        })
+      : await invoke("export_path", { path: p, outDir, onConflict, skipRules });
     // 后端会在消息里写明是"已暂停"还是"已导出"，直接透出
     setStatus(msg, msg.startsWith("已暂停") ? "" : "ok");
   } catch (e) {
@@ -420,7 +444,6 @@ $("btn-up").onclick = () => {
   parts.pop();
   navigate("/" + parts.join("/"));
 };
-$("btn-save").onclick = saveSelected;
 $("btn-recover").onclick = recoverAll;
 
 (async () => {
