@@ -1,7 +1,7 @@
 //! 源解析：把 `<源> + --partition/--offset` 解析成一个可用的文件系统。
 
 use dmdisk::{human_size, Partition, Source};
-use dmfs::{probe, AnyFs, FsKind};
+use dmfs::{probe, probe_partition, AnyFs, FsKind};
 
 pub struct Opened {
     pub fs: AnyFs,
@@ -73,7 +73,7 @@ pub fn open_fs(
     let mut candidates: Vec<(usize, &Partition)> = Vec::new();
     for (i, p) in table.partitions.iter().enumerate() {
         let r = src.volume(p.offset, p.size);
-        if probe(&r) != FsKind::Unknown {
+        if probe_partition(&r) != FsKind::Unknown {
             candidates.push((i + 1, p));
         }
     }

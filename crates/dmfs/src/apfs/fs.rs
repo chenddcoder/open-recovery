@@ -211,7 +211,7 @@ impl Apfs {
     }
 
     fn tree(&self) -> Tree<'_> {
-        Tree::variable(&self.reader, self.bs)
+        Tree::fs_tree(&self.reader, self.bs)
     }
 
     fn resolver(&self) -> VolResolver<'_> {

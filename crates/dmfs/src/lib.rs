@@ -14,6 +14,6 @@ pub mod ntfs;
 pub mod types;
 pub mod util;
 
-pub use detect::{probe, AnyFs};
+pub use detect::{probe, probe_partition, AnyFs};
 pub use dmdisk::{Error, Result};
 pub use types::{resolve, sanitize_name, Entry, FileSystem, FsInfo, FsKind, NodeId, NodeKind};

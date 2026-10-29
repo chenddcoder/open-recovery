@@ -41,23 +41,98 @@ fn u64le(b: &[u8], o: usize) -> u64 {
     ])
 }
 
+/// 键的比较方式。APFS 里两种树的键语义不同，**不能统一按字节序比**：
+///
+/// * fs-tree 的 `j_key_t` 是**大端** `(obj_id << 60) | type`，字节序比较恰好等于数值比较；
+/// * omap 的 `omap_key_t` 是 `{u64 oid; u64 xid}` **小端**，字节序比较会把
+///   `oid=1051`（字节 `1b 04`）判成大于 `oid=178945`（字节 `01 bb 02`），
+///   于是起始键一跳过，整张表就"查不到对象"。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KeyOrder {
+    /// 逐字节字典序（适用于大端整数键与变长键）
+    Lexicographic,
+    /// omap 专用：前 8 字节 oid、后 8 字节 xid，均按小端数值比较
+    OmapKey,
+    /// fs-tree 专用：`j_key` 是 `(type << 60) | obj_id` 的小端 u64，
+    /// 但排序语义是**先 obj_id（低 60 位）、再 type（高 4 位）**，最后比剩余字节。
+    JKey,
+}
+
+impl KeyOrder {
+    pub fn cmp(self, a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+        match self {
+            KeyOrder::Lexicographic => a.cmp(b),
+            KeyOrder::OmapKey => {
+                if a.len() >= 16 && b.len() >= 16 {
+                    let ao = u64::from_le_bytes(a[0..8].try_into().unwrap());
+                    let bo = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                    ao.cmp(&bo).then_with(|| {
+                        let ax = u64::from_le_bytes(a[8..16].try_into().unwrap());
+                        let bx = u64::from_le_bytes(b[8..16].try_into().unwrap());
+                        ax.cmp(&bx)
+                    })
+                } else {
+                    a.cmp(b)
+                }
+            }
+            KeyOrder::JKey => {
+                if a.len() >= 8 && b.len() >= 8 {
+                    let av = u64::from_le_bytes(a[0..8].try_into().unwrap());
+                    let bv = u64::from_le_bytes(b[0..8].try_into().unwrap());
+                    // 低 60 位是 obj_id，高 4 位是类型
+                    let aid = av & 0x0fff_ffff_ffff_ffff;
+                    let bid = bv & 0x0fff_ffff_ffff_ffff;
+                    aid.cmp(&bid)
+                        .then_with(|| (av >> 60).cmp(&(bv >> 60)))
+                        .then_with(|| a[8..].cmp(&b[8..]))
+                } else {
+                    a.cmp(b)
+                }
+            }
+        }
+    }
+}
+
 pub struct Tree<'r> {
     pub reader: &'r Reader,
     pub bs: u32,
     /// 定长树的键长度（变长树为 None）
     pub key_len: Option<usize>,
     pub val_len: Option<usize>,
+    pub order: KeyOrder,
 }
 
 impl<'r> Tree<'r> {
     /// 变长键值树（fs-tree 等）
     pub fn variable(reader: &'r Reader, bs: u32) -> Self {
-        Self { reader, bs, key_len: None, val_len: None }
+        Self { reader, bs, key_len: None, val_len: None, order: KeyOrder::Lexicographic }
+    }
+
+    /// fs-tree：键是比较语义特殊的 `j_key`（见 [`KeyOrder::JKey`]）。
+    pub fn fs_tree(reader: &'r Reader, bs: u32) -> Self {
+        Self { reader, bs, key_len: None, val_len: None, order: KeyOrder::JKey }
     }
 
     /// 定长键值树（omap：键 16B / 值 16B）
     pub fn fixed(reader: &'r Reader, bs: u32, key_len: usize, val_len: usize) -> Self {
-        Self { reader, bs, key_len: Some(key_len), val_len: Some(val_len) }
+        Self {
+            reader,
+            bs,
+            key_len: Some(key_len),
+            val_len: Some(val_len),
+            order: KeyOrder::Lexicographic,
+        }
+    }
+
+    /// 定长 omap 树：键按 `(oid, xid)` 小端数值比较。
+    pub fn fixed_omap(reader: &'r Reader, bs: u32, key_len: usize, val_len: usize) -> Self {
+        Self {
+            reader,
+            bs,
+            key_len: Some(key_len),
+            val_len: Some(val_len),
+            order: KeyOrder::OmapKey,
+        }
     }
 
     pub fn node(&self, paddr: u64) -> Result<BNode> {
@@ -97,7 +172,7 @@ impl<'r> Tree<'r> {
                     .find(|(k, _)| k.as_slice() == key)
                     .map(|(_, v)| v));
             }
-            let idx = child_index(&node, key);
+            let idx = child_index(&node, key, self.order);
             paddr = res.node_paddr(u64le(&node.entries[idx].1, 0))?;
         }
     }
@@ -137,7 +212,7 @@ impl<'r> Tree<'r> {
         if node.is_leaf() {
             for (k, v) in &node.entries {
                 // ghost 记录（键长 0）是删除标记，不参与结果
-                if k.is_empty() || k.as_slice() < start {
+                if k.is_empty() || self.order.cmp(k, start).is_lt() {
                     continue;
                 }
                 st.hits += 1;
@@ -151,7 +226,7 @@ impl<'r> Tree<'r> {
         // 可能包含 start 的子节点：最后一个「首键 ≤ start」的项。
         // 再往前一个也无害（子节点内会再按 start 过滤），但不能跳过它，
         // 因为索引键存的是子节点首键，start 可能落在两键之间的空隙里。
-        let first = child_index_floor(&node, start);
+        let first = child_index_floor(&node, start, self.order);
         for entry in node.entries.iter().skip(first) {
             let child = u64le(&entry.1, 0);
             let cp = res.node_paddr(child)?;
@@ -169,10 +244,10 @@ struct ScanState {
 }
 
 /// 索引节点下降：最后一个键 ≤ target 的项（二分）。
-fn child_index(node: &BNode, target: &[u8]) -> usize {
+fn child_index(node: &BNode, target: &[u8], order: KeyOrder) -> usize {
     match node
         .entries
-        .binary_search_by(|(k, _)| k.as_slice().cmp(target))
+        .binary_search_by(|(k, _)| order.cmp(k, target))
     {
         Ok(i) => i,
         Err(0) => 0,
@@ -181,6 +256,79 @@ fn child_index(node: &BNode, target: &[u8]) -> usize {
 }
 
 /// 范围扫描起点：命中时从该项开始，未命中时从前一项开始（覆盖间隙）。
-fn child_index_floor(node: &BNode, target: &[u8]) -> usize {
-    child_index(node, target)
+fn child_index_floor(node: &BNode, target: &[u8], order: KeyOrder) -> usize {
+    child_index(node, target, order)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyOrder;
+    use std::cmp::Ordering;
+
+    fn be(v: u64) -> Vec<u8> {
+        v.to_be_bytes().to_vec()
+    }
+
+    /// 这两组比较曾经都是"字节序比一遍"了事，小镜像碰巧正确，
+    /// 真盘上 obj_id / oid 一跨进位边界就整棵树的查询错位。
+    #[test]
+    fn omap_key_compares_numerically_not_by_bytes() {
+        let k = KeyOrder::OmapKey;
+        let a = {
+            let mut v = 1051u64.to_le_bytes().to_vec();
+            v.extend_from_slice(&1u64.to_le_bytes());
+            v
+        };
+        let b = {
+            let mut v = 178_945u64.to_le_bytes().to_vec();
+            v.extend_from_slice(&0u64.to_le_bytes());
+            v
+        };
+        assert_eq!(k.cmp(&a, &b), Ordering::Less, "1051 必须小于 178945");
+        // 字节序下首字节 0x1b > 0x01，会得出相反结论
+        assert_eq!(a.cmp(&b), Ordering::Greater, "这正是原来的 bug");
+    }
+
+    #[test]
+    fn omap_key_orders_by_xid_within_same_oid() {
+        let k = KeyOrder::OmapKey;
+        let mut a = 7u64.to_le_bytes().to_vec();
+        a.extend_from_slice(&1u64.to_le_bytes());
+        let mut b = 7u64.to_le_bytes().to_vec();
+        b.extend_from_slice(&2u64.to_le_bytes());
+        assert_eq!(k.cmp(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn jkey_orders_by_obj_id_across_boundaries() {
+        let k = KeyOrder::JKey;
+        // (type<<60)|obj_id，小端存储
+        let key = |obj: u64, ty: u64| ((ty << 60) | obj).to_le_bytes().to_vec();
+        assert_eq!(k.cmp(&key(255, 9), &key(256, 9)), Ordering::Less, "跨 256 边界");
+        assert_eq!(k.cmp(&key(65535, 9), &key(65536, 9)), Ordering::Less, "跨 65536 边界");
+        assert_eq!(k.cmp(&key(2, 9), &key(3, 9)), Ordering::Less);
+    }
+
+    #[test]
+    fn jkey_orders_by_type_within_same_obj() {
+        let k = KeyOrder::JKey;
+        let key = |obj: u64, ty: u64| ((ty << 60) | obj).to_le_bytes().to_vec();
+        assert_eq!(k.cmp(&key(5, 3), &key(5, 9)), Ordering::Less, "同 id 下 inode(3) 在 drec(9) 前");
+    }
+
+    #[test]
+    fn jkey_falls_back_to_tail_bytes() {
+        let k = KeyOrder::JKey;
+        let mut a = ((9u64 << 60) | 5).to_le_bytes().to_vec();
+        a.extend_from_slice(b"abc");
+        let mut b = ((9u64 << 60) | 5).to_le_bytes().to_vec();
+        b.extend_from_slice(b"abd");
+        assert_eq!(k.cmp(&a, &b), Ordering::Less);
+    }
+
+    #[test]
+    fn lexicographic_still_used_for_big_endian() {
+        let k = KeyOrder::Lexicographic;
+        assert_eq!(k.cmp(&be(1), &be(2)), Ordering::Less);
+    }
 }

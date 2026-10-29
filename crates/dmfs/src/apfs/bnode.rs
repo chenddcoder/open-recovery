@@ -99,12 +99,11 @@ impl BNode {
         for i in 0..nkeys {
             let t = HDR_SIZE + toff + i * step;
             let (ko, klen, vo, vlen) = if fixed {
-                (
-                    u16le(buf, t) as usize,
-                    key_len.unwrap(),
-                    u16le(buf, t + 2) as usize,
-                    val_len.unwrap(),
-                )
+                // 索引节点（level>0）的值固定是 8 字节子节点 oid，
+                // 与叶子节点的 val_size 无关。按 16 字节取会把值区顶出块外，
+                // 表现为「第 0 项值越界（4048..4064）」这种差 8 字节的报错。
+                let vl = if level > 0 { 8 } else { val_len.unwrap() };
+                (u16le(buf, t) as usize, key_len.unwrap(), u16le(buf, t + 2) as usize, vl)
             } else {
                 (
                     u16le(buf, t) as usize,

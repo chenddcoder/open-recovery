@@ -49,18 +49,36 @@ impl Omap {
         oid: u64,
         max_xid: u64,
     ) -> Result<Option<OmapVal>> {
-        let tree = Tree::fixed(reader, bs, KEY_LEN, VAL_LEN);
+        let tree = Tree::fixed_omap(reader, bs, KEY_LEN, VAL_LEN);
         let mut start = Vec::with_capacity(KEY_LEN);
         start.extend_from_slice(&oid.to_le_bytes());
         start.extend_from_slice(&0u64.to_le_bytes());
 
         let mut best: Option<(u64, OmapVal)> = None;
         let mut err: Option<Error> = None;
+        let dbg = std::env::var("DMDE_DEBUG_APFS").is_ok();
+        if dbg {
+            eprintln!("[omap] tree_paddr={} oid={} max_xid={}", self.tree_paddr, oid, max_xid);
+            match tree.node(self.tree_paddr) {
+                Ok(n) => eprintln!(
+                    "[omap] root: level={} nkeys={} fixed={} root={}",
+                    n.level,
+                    n.entries.len(),
+                    n.fixed,
+                    n.is_root
+                ),
+                Err(e) => eprintln!("[omap] root 解析失败: {e}"),
+            }
+        }
         tree.scan(self.tree_paddr, &mut PhysicalOid, &start, &mut |k, v| {
             if k.len() < KEY_LEN || v.len() < VAL_LEN {
                 return true;
             }
             let key_oid = u64::from_le_bytes(k[0..8].try_into().unwrap());
+            if dbg {
+                let kx = u64::from_le_bytes(k[8..16].try_into().unwrap());
+                eprintln!("[omap]   entry oid={key_oid} xid={kx}");
+            }
             if key_oid != oid {
                 return false; // 走过头了
             }
