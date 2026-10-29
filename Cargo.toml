@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/dmdisk", "crates/dmfs", "crates/dmcli"]
+# GUI 依赖 Tauri，独立构建，不进主工作区（保证 `cargo test` 只跑核心引擎）
+exclude = ["gui/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.70"
+repository = "https://github.com/chenddcoder/dmde-rs"
+description = "Open-source disk editor and data recovery toolkit (DMDE-alike)"
+
+[workspace.dependencies]
+dmdisk = { path = "crates/dmdisk" }
+dmfs = { path = "crates/dmfs" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

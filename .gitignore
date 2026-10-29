@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+.DS_Store
+/gui/src-tauri/gen
+/gui/src-tauri/target
+node_modules
+/test-images
+/gui/src-tauri/.cargo/
+/dist

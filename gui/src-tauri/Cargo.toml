@@ -1,0 +1,20 @@
+[package]
+name = "dmde-gui"
+version = "0.1.0"
+edition = "2021"
+description = "dmde-rs 图形界面（Tauri v2）"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "dmde_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dmdisk = { path = "../../crates/dmdisk" }
+dmfs = { path = "../../crates/dmfs" }

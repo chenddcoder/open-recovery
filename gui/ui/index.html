@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>dmde-rs · 开源磁盘编辑器与数据恢复</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">dm</span>
+      <div>
+        <h1>dmde-rs</h1>
+        <p class="sub">开源磁盘编辑器与数据恢复 · 全程只读</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <span class="pill safe">只读模式</span>
+      <button id="btn-refresh" class="ghost">刷新磁盘</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section>
+        <h2>物理磁盘</h2>
+        <div id="disks" class="list"></div>
+      </section>
+
+      <section>
+        <h2>打开镜像 / 设备</h2>
+        <form id="open-form" class="open-form">
+          <input id="input-path" type="text" placeholder="/path/to/disk.img 或 /dev/rdisk4" spellcheck="false" />
+          <button type="submit">打开</button>
+        </form>
+        <p class="hint">.dmg 需先 <code>hdiutil convert -format UDRW -o out raw.dmg</code></p>
+      </section>
+
+      <section id="partitions-wrap" class="hidden">
+        <h2>分区</h2>
+        <div id="partitions" class="list"></div>
+      </section>
+
+      <section class="volume-card hidden" id="volume-card">
+        <h2>当前卷</h2>
+        <dl id="volume-info"></dl>
+      </section>
+    </aside>
+
+    <section class="browser">
+      <div class="toolbar">
+        <div class="crumbs" id="crumbs"></div>
+        <div class="tool-group">
+          <label class="toggle">
+            <input type="checkbox" id="chk-deleted" />
+            <span>显示已删除</span>
+          </label>
+          <button id="btn-up" class="ghost">上一级</button>
+          <button id="btn-scan" class="ghost">扫描可恢复文件</button>
+        </div>
+      </div>
+
+      <div class="table-head">
+        <span class="col-name">名称</span>
+        <span class="col-size">大小</span>
+        <span class="col-time">修改时间</span>
+        <span class="col-tag">状态</span>
+      </div>
+      <div id="entries" class="entries">
+        <p class="empty">从左侧选择磁盘或输入镜像路径开始</p>
+      </div>
+    </section>
+
+    <aside class="preview">
+      <h2>预览</h2>
+      <div class="preview-meta" id="preview-meta">未选择文件</div>
+      <pre id="preview-body" class="preview-body"></pre>
+      <div class="preview-actions">
+        <label class="field">
+          <span>输出目录</span>
+          <input id="input-out" type="text" spellcheck="false" />
+        </label>
+        <button id="btn-save" class="primary" disabled>保存到输出目录</button>
+        <button id="btn-recover" class="ghost">批量恢复已删除</button>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="statusbar">
+    <span id="status">就绪</span>
+    <span id="stats" class="stats"></span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,9 @@
+[package]
+name = "dmdisk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Block device access, partition table parsing and read-only I/O for dmde-rs (no external dependencies)"
+
+[dependencies]
