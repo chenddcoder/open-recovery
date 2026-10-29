@@ -143,13 +143,6 @@ fn handle(stream: UnixStream, opt: &ServeOptions, st: &mut State) -> std::io::Re
                 }
                 Err(e) => proto::write_reply(&mut w, &Reply::Error { message: e.message })?,
             },
-            Request::DirSize { path, budget_ms } => match st.session.as_ref() {
-                Some(s) => match s.dir_size(&path, budget_ms) {
-                    Ok(size) => proto::write_reply(&mut w, &Reply::DirSize { size })?,
-                    Err(e) => proto::write_reply(&mut w, &Reply::Error { message: e })?,
-                },
-                None => proto::write_reply(&mut w, &Reply::Error { message: NOT_OPEN.into() })?,
-            },
             Request::Stat { path } => match st.session.as_mut() {
                 Some(s) => match s.stat(&path) {
                     Ok(entry) => proto::write_reply(&mut w, &Reply::Entry { entry })?,

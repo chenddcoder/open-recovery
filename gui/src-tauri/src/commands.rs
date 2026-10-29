@@ -157,36 +157,6 @@ fn dump_to_dir(
     }
 }
 
-/// 统计目录总大小。
-///
-/// 带时间预算：给"这个目录多大、要不要导出"这个问题一个**有界**的答案，
-/// 而不是让界面无声地转几分钟。超过预算返回 `exact=false`，UI 会显示 `≥`。
-#[tauri::command]
-pub async fn dir_size(
-    state: tauri::State<'_, AppState>,
-    path: String,
-    budget_ms: Option<u64>,
-) -> Result<dmrpc::DirSizeDto, String> {
-    let mut backend = {
-        let mut g = state.backend.lock().map_err(|_| not_open())?;
-        g.take().ok_or_else(not_open)?
-    };
-    let budget = budget_ms.unwrap_or(8000);
-    let joined = tauri::async_runtime::spawn_blocking(move || {
-        let r = backend.dir_size(&path, budget);
-        (backend, r)
-    })
-    .await;
-    match joined {
-        Ok((b, r)) => {
-            let mut g = state.backend.lock().map_err(|_| not_open())?;
-            *g = Some(b);
-            r
-        }
-        Err(e) => Err(format!("统计任务异常: {e}")),
-    }
-}
-
 #[tauri::command]
 pub fn save_file(
     state: tauri::State<AppState>,

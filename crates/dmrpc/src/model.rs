@@ -91,20 +91,3 @@ pub struct RecoverDto {
     pub out_dir: String,
     pub saved: Vec<String>,
 }
-
-/// 目录大小统计结果。
-///
-/// `exact=false` 表示**没算完**（时间到/条目上限），此时 bytes 是"至少这么大"——
-/// 恢复场景下不能把半截统计当成精确值告诉用户，否则会误判"这点大小不用导"。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DirSizeDto {
-    pub bytes: u64,
-    pub bytes_human: String,
-    pub files: u64,
-    pub dirs: u64,
-    pub exact: bool,
-    /// `fs` = 文件系统自带的目录统计（精确且瞬时）
-    /// `scan` = 本工具递归累加
-    /// `file` = 这是一个文件，直接返回它的大小
-    pub source: String,
-}

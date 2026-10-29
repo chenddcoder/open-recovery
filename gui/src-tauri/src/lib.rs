@@ -39,7 +39,6 @@ pub fn run() {
             commands::scan_deleted,
             commands::recover_all,
             commands::export_path,
-            commands::dir_size,
             commands::cancel_export,
             commands::default_out_dir,
             commands::admin_state,
