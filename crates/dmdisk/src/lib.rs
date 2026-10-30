@@ -12,6 +12,7 @@ pub mod plist;
 pub mod platform;
 pub mod reader;
 pub mod scheme;
+pub mod write;
 
 pub use device::{read_full, BlockDevice, ImageFile, RawDevice};
 pub use error::{Error, Result};

@@ -9,6 +9,7 @@
 
 pub mod commands;
 mod priv_helper;
+pub mod repair;
 pub mod skip;
 
 use dmrpc::Backend;
@@ -19,6 +20,11 @@ use std::sync::{Arc, Mutex};
 pub struct AppState {
     /// 当前会话：本地进程读 or 特权 helper 读
     pub backend: Mutex<Option<Backend>>,
+    /// 当前源的定位信息（设备路径、容器偏移、块大小）。
+    ///
+    /// 单独存一份，是因为容器头修复要直接按"设备 + 偏移"写盘，
+    /// 而 `Backend` 里拿不到这些（Remote 分支只有一个 socket 客户端）。
+    pub source_info: Mutex<Option<dmrpc::SourceDto>>,
     /// 导出暂停标志。
     ///
     /// 单独放在这里、而不是塞进 Backend：导出期间 backend 已被 `take()` 走，
@@ -54,7 +60,9 @@ pub fn run() {
             commands::admin_state,
             commands::request_admin,
             commands::drop_admin,
-            commands::current_source
+            commands::current_source,
+            repair::apfs_repair_scan,
+            repair::apfs_repair_apply
         ])
         .run(tauri::generate_context!())
         .expect("启动 Tauri 应用失败");

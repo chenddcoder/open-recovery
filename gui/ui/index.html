@@ -47,6 +47,8 @@
       <section class="volume-card hidden" id="volume-card">
         <h2>当前卷</h2>
         <dl id="volume-info"></dl>
+        <!-- 写盘入口只留一行，具体操作在弹层里做 -->
+        <button id="btn-repair-open" class="ghost mini-wide hidden">修复容器头…</button>
       </section>
     </aside>
 
@@ -112,6 +114,25 @@
     <span id="status">就绪</span>
     <span id="stats" class="stats"></span>
   </footer>
+
+  <!-- 容器头修复弹层。
+       这是全工具唯一的写盘操作，单独占一层：不会被侧栏挤掉，
+       也天然形成"先把清单看仔细再点确认"的节奏。 -->
+  <div id="repair-modal" class="modal" hidden>
+    <div class="modal-box">
+      <h3>APFS 容器头修复</h3>
+      <p class="hint" id="repair-state">
+        检查容器块 0 的超级块是否完好。损坏时可以用检查点里的副本写回（只写 4 KiB）。
+      </p>
+      <div id="repair-items" class="repair-items"></div>
+      <p class="hint warn" id="repair-note" hidden></p>
+      <div class="modal-actions">
+        <button id="btn-repair-scan" class="ghost">检查容器头</button>
+        <button id="btn-repair-close" class="ghost">关闭</button>
+        <button id="btn-repair-apply" class="ghost danger" disabled>写回块 0</button>
+      </div>
+    </div>
+  </div>
 
   <script src="app.js"></script>
 </body>

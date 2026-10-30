@@ -1,6 +1,6 @@
 //! helper 客户端。所有调用都返回人类可读的中文错误，方便直接展示到状态栏。
 
-use crate::model::{DiskDto, EntryDto, PreviewDto, SourceDto};
+use crate::model::{DiskDto, EntryDto, NxsbReportDto, PreviewDto, SourceDto};
 use crate::proto::{self, Reply, Request};
 use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -162,6 +162,52 @@ impl Client {
     pub fn read_path(&mut self, path: &str, out: &mut dyn Write) -> Result<u64, String> {
         self.start(&Request::ReadPath { path: path.to_string() })?;
         self.drain(out)
+    }
+
+    /// 列出容器里所有可用的 NXSB 副本。
+    pub fn scan_nxsb(
+        &mut self,
+        source: &str,
+        container_offset: u64,
+        block_size: u32,
+    ) -> Result<NxsbReportDto, String> {
+        let req = Request::ScanNxsb {
+            source: source.to_string(),
+            container_offset,
+            block_size,
+        };
+        match self.call(&req) {
+            Ok(Reply::NxsbList { report }) => Ok(report),
+            Ok(Reply::Error { message }) => Err(message),
+            Ok(other) => Err(unexpected(&other).to_string()),
+            Err(e) => Err(format!("连接 helper 失败: {e}")),
+        }
+    }
+
+    /// 修复 APFS 容器头（全协议唯一的写操作）。
+    ///
+    /// 返回 `(写入字节数, 该副本的 xid, 备份文件路径)`。
+    pub fn repair_nxsb(
+        &mut self,
+        source: &str,
+        container_offset: u64,
+        block_size: u32,
+        src_paddr: u64,
+        backup_path: &str,
+    ) -> Result<(u64, u64, String), String> {
+        let req = Request::RepairNxsb {
+            source: source.to_string(),
+            container_offset,
+            block_size,
+            src_paddr,
+            backup_path: backup_path.to_string(),
+        };
+        match self.call(&req) {
+            Ok(Reply::Repaired { bytes, xid, backup_path }) => Ok((bytes, xid, backup_path)),
+            Ok(Reply::Error { message }) => Err(message),
+            Ok(other) => Err(unexpected(&other).to_string()),
+            Err(e) => Err(format!("连接 helper 失败: {e}")),
+        }
     }
 
     /// 只发请求，不读响应——读文件的响应本身就是 chunk 流，

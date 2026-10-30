@@ -198,6 +198,58 @@ fn handle(stream: UnixStream, opt: &ServeOptions, st: &mut State) -> std::io::Re
                 };
                 stream_out(&mut w, |sink| s.read_path(&path, sink))?;
             }
+            Request::ScanNxsb {
+                ref source,
+                container_offset,
+                block_size,
+            } => match crate::repair::scan_nxsb(source, container_offset, block_size) {
+                Ok(report) => proto::write_reply(&mut w, &Reply::NxsbList { report })?,
+                Err(message) => proto::write_reply(&mut w, &Reply::Error { message })?,
+            },
+            Request::RepairNxsb {
+                ref source,
+                container_offset,
+                block_size,
+                src_paddr,
+                ref backup_path,
+            } => {
+                // helper 以 root 跑，这里必须自己把关：否则一条请求就能变成
+                // "往任意路径任意偏移写"。只放开物理块设备。
+                if !source.starts_with("/dev/rdisk") {
+                    proto::write_reply(
+                        &mut w,
+                        &Reply::Error {
+                            message: format!("只允许修复 /dev/rdisk* 物理设备，收到 {source}"),
+                        },
+                    )?;
+                    continue;
+                }
+                match crate::repair::repair_nxsb(
+                    source,
+                    container_offset,
+                    block_size,
+                    src_paddr,
+                    backup_path,
+                ) {
+                    Ok(o) => {
+                        // 备份文件是 root 写的，得还给发起请求的用户，
+                        // 否则用户在 Finder 里既打不开也删不掉
+                        #[cfg(unix)]
+                        if let (Some(uid), Some(gid)) = (opt.uid, opt.gid) {
+                            let _ = std::os::unix::fs::chown(&o.backup_path, Some(uid), Some(gid));
+                        }
+                        proto::write_reply(
+                            &mut w,
+                            &Reply::Repaired {
+                                bytes: o.bytes,
+                                xid: o.xid,
+                                backup_path: o.backup_path,
+                            },
+                        )?
+                    }
+                    Err(message) => proto::write_reply(&mut w, &Reply::Error { message })?,
+                }
+            }
         }
     }
 }

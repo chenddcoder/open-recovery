@@ -24,6 +24,7 @@ pub mod obj;
 pub mod omap;
 pub mod record;
 pub mod recover;
+pub mod repair;
 pub mod volume;
 
 pub use container::Container;

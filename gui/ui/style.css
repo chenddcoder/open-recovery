@@ -132,6 +132,57 @@ button.ghost { background: transparent; }
 .volume-card dt { color: var(--text-dim); }
 .volume-card dd { margin: 0; font-family: var(--mono); word-break: break-all; }
 
+/* ---------- 容器头修复弹层 ---------- */
+.modal {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(4, 6, 10, .62);
+  backdrop-filter: blur(2px);
+}
+.modal-box {
+  width: min(560px, 92vw); max-height: 82vh; overflow-y: auto;
+  background: var(--bg-alt);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px 18px 14px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, .55);
+}
+.modal-box h3 { margin: 0 0 8px; font-size: 13.5px; font-weight: 600; }
+.modal-actions {
+  display: flex; gap: 8px; justify-content: flex-end;
+  margin-top: 12px; padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+.modal-actions button { padding: 5px 12px; font-size: 11.5px; }
+
+.repair-items {
+  display: flex; flex-direction: column; gap: 3px;
+  margin: 8px 0 0; max-height: 240px; overflow-y: auto;
+}
+.repair-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center; gap: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 5px;
+  font-size: 11.5px; cursor: pointer;
+}
+.repair-item:hover { border-color: var(--accent-dim); }
+.repair-item input { margin: 0; accent-color: var(--accent); }
+.repair-item .ri-main {
+  font-family: var(--mono);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.repair-item .ri-sub { color: var(--text-dim); font-size: 10.5px; white-space: nowrap; }
+
+/* "上膛"状态：按钮一眼看出下一次点击真的会写盘 */
+button.armed {
+  border-color: var(--danger) !important;
+  background: #3a1a1a !important;
+  color: #ffb4b4 !important;
+}
+.hint.warn { color: var(--warn); }
+button.mini-wide { width: 100%; margin-top: 10px; padding: 5px 8px; font-size: 11px; }
+
 /* ---------- 浏览区 ---------- */
 .toolbar {
   display: flex; align-items: center; justify-content: space-between;

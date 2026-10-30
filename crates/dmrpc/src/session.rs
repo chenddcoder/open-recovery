@@ -230,6 +230,10 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
         }
     };
 
+    // 容器在设备内的字节偏移。修复容器头时要把"容器块号"换成设备偏移，
+    // 而 `reader` 马上要被 move 进 AnyFs，所以先取出来。
+    let container_offset = reader.base();
+
     // APFS 是容器套卷：真机上卷 0 常常是 Preboot/System，恢复要的却是 Data 卷。
     // 这里自动挑「角色含 Data 的卷」，挑不到再退回 0，并把卷名写进描述。
     let mut desc = desc;
@@ -256,6 +260,8 @@ pub fn open(source: &str, partition: Option<usize>) -> Result<(Session, SourceDt
         total_human: human_size(info.total_bytes),
         free_bytes: info.free_bytes,
         details: info.details.clone(),
+        container_offset,
+        device: source.to_string(),
     };
     Ok((Session { source: source.to_string(), desc, fs, cache: HashMap::new() }, dto))
 }

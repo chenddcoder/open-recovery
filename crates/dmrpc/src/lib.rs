@@ -10,12 +10,13 @@ pub mod backend;
 pub mod client;
 pub mod model;
 pub mod proto;
+pub mod repair;
 pub mod server;
 pub mod session;
 
 pub use backend::{open_local, Backend};
 pub use client::Client;
-pub use model::{DiskDto, EntryDto, PartDto, PreviewDto, RecoverDto, SourceDto};
+pub use model::{DiskDto, EntryDto, NxsbCandidateDto, NxsbReportDto, PartDto, PreviewDto, RecoverDto, SourceDto};
 pub use session::Session;
 
 /// helper 与 GUI 约定的版本号：两边不一致时 GUI 会提示重建

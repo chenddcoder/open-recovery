@@ -173,6 +173,150 @@ function renderVolume(src) {
   $("volume-info").innerHTML = rows
     .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`)
     .join("");
+  renderRepairCard(src);
+}
+
+// ---------------- 容器头修复 ----------------
+//
+// APFS 把容器超级块（NXSB）放在容器块 0，同时又往检查点区反复写副本。
+// 块 0 是全盘写入最频繁的位置之一：掉电、USB 桥掉线、睡眠唤醒失败，
+// 最先被打坏的就是它。一坏，系统直接判定"这个分区没有文件系统"，
+// diskutil 显示 File System: None，Finder 里连分区都不出现。
+//
+// 但副本通常完好，所以把校验通过、xid 最大的那份写回块 0 就能整盘救回来。
+// 这是全工具**唯一**的写盘操作，所以入口要用户自己点、清单要用户自己选、
+// 还要再点一次确认。
+
+let repairArmed = false;
+
+function resetRepair() {
+  repairArmed = false;
+  $("repair-items").innerHTML = "";
+  $("repair-note").hidden = true;
+  const b = $("btn-repair-apply");
+  b.disabled = true;
+  b.textContent = "写回块 0";
+  b.classList.remove("armed");
+  $("repair-state").textContent = "正在检查容器块 0 …";
+}
+
+/// 只有 APFS 才有"容器超级块"这个概念，其它文件系统直接不显示入口，
+/// 免得让人以为哪都能点。
+function renderRepairCard(src) {
+  const isApfs = (src.fs_kind || "").toUpperCase().includes("APFS");
+  $("btn-repair-open").classList.toggle("hidden", !isApfs);
+  if (!isApfs) closeRepair();
+}
+
+async function openRepair() {
+  $("repair-modal").hidden = false;
+  resetRepair();
+  await scanRepair();
+}
+
+function closeRepair() {
+  $("repair-modal").hidden = true;
+  repairArmed = false;
+}
+
+async function scanRepair() {
+  const btn = $("btn-repair-scan");
+  btn.disabled = true;
+  btn.textContent = "检查中…";
+  setStatus("正在扫描容器头副本…");
+  try {
+    const r = await invoke("apfs_repair_scan");
+    renderRepairResult(r);
+    setStatus(
+      r.block0_ok
+        ? "容器块 0 完好，不需要修复"
+        : `块 0 已损坏，找到 ${r.candidates.length} 份可用副本`,
+      r.block0_ok ? "ok" : "error"
+    );
+  } catch (e) {
+    $("repair-state").textContent = "扫描失败：" + e;
+    setStatus(String(e), "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "重新检查";
+  }
+}
+
+function renderRepairResult(r) {
+  const box = $("repair-items");
+  box.innerHTML = "";
+  const applyBtn = $("btn-repair-apply");
+
+  if (r.block0_ok) {
+    $("repair-state").textContent =
+      `块 0 完好（xid ${r.block0_xid}），不需要修复。` +
+      `下面列出的是检查点区里的历史副本，仅供查看。`;
+    applyBtn.disabled = true;
+  } else if (!r.candidates.length) {
+    $("repair-state").textContent =
+      `块 0 已损坏，但扫了 ${r.scanned_blocks} 个块也没找到校验通过的副本 —— ` +
+      `容器可能被整体覆盖，这种情况无法用这个方法救。`;
+    applyBtn.disabled = true;
+    return;
+  } else {
+    $("repair-state").textContent =
+      `块 0 的超级块已损坏。扫描 ${r.scanned_blocks} 个块，` +
+      `找到 ${r.candidates.length} 份可用副本；选一份写回即可。`;
+  }
+
+  if (r.cksum_bad > 0) {
+    $("repair-note").hidden = false;
+    $("repair-note").textContent =
+      `另有 ${r.cksum_bad} 份副本校验失败（坏盘迹象，但不影响用有效副本修复）。`;
+  }
+
+  r.candidates.forEach((c, i) => {
+    const label = document.createElement("label");
+    label.className = "repair-item";
+    label.innerHTML = `
+      <input type="radio" name="nxsb" value="${c.paddr}" ${i === 0 && !r.block0_ok ? "checked" : ""} />
+      <span class="ri-main">块 ${c.paddr} · xid ${c.xid}</span>
+      <span class="ri-sub">${c.volume_count} 个卷</span>`;
+    label.querySelector("input").onchange = () => {
+      if (!r.block0_ok) applyBtn.disabled = false;
+      repairArmed = false;
+      applyBtn.textContent = "写回块 0";
+      applyBtn.classList.remove("armed");
+    };
+    box.appendChild(label);
+  });
+
+  if (!r.block0_ok && r.candidates.length) applyBtn.disabled = false;
+}
+
+async function applyRepair() {
+  const sel = document.querySelector('input[name="nxsb"]:checked');
+  if (!sel) return;
+  const btn = $("btn-repair-apply");
+
+  // 两步确认：第一下只是"上膛"，不会写盘。写盘是不可逆的，
+  // 用系统 confirm 在 WebView 里不一定弹得出来，就地做更可靠。
+  if (!repairArmed) {
+    repairArmed = true;
+    btn.textContent = "确认写回？再点一次";
+    btn.classList.add("armed");
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = "写入中…";
+  setStatus(`正在把块 ${sel.value} 的副本写回块 0…`);
+  try {
+    const msg = await invoke("apfs_repair_apply", { srcPaddr: Number(sel.value) });
+    setStatus(msg, "ok");
+  } catch (e) {
+    setStatus(String(e), "error");
+  } finally {
+    repairArmed = false;
+    btn.textContent = "写回块 0";
+    btn.classList.remove("armed");
+    btn.disabled = false;
+  }
 }
 
 // ---------------- 浏览 ----------------
@@ -545,6 +689,10 @@ $("btn-up").onclick = () => {
   navigate("/" + parts.join("/"));
 };
 $("btn-recover").onclick = recoverAll;
+$("btn-repair-open").onclick = openRepair;
+$("btn-repair-close").onclick = closeRepair;
+$("btn-repair-scan").onclick = scanRepair;
+$("btn-repair-apply").onclick = applyRepair;
 
 // 列表快捷键：⌘A 全选当前目录、Esc 清空选择。
 // 输入框里打字时不要抢这两个键。
@@ -558,6 +706,11 @@ document.addEventListener("keydown", (ev) => {
     paintSelection();
     refreshPreview();
   } else if (ev.key === "Escape") {
+    // 弹层开着时 Esc 先关弹层，别顺手把下面的选择也清了
+    if (!$("repair-modal").hidden) {
+      closeRepair();
+      return;
+    }
     clearSelection();
   }
 });

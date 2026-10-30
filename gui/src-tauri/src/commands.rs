@@ -134,6 +134,11 @@ pub async fn open_source(
     let (backend, dto) = opened?;
     let mut guard = state.backend.lock().map_err(|_| not_open())?;
     *guard = Some(backend);
+    drop(guard);
+    // 修复容器头时要按「设备 + 容器偏移」直接写盘，把定位信息一起存下来
+    if let Ok(mut g) = state.source_info.lock() {
+        *g = Some(dto.clone());
+    }
     Ok(dto)
 }
 

@@ -1,7 +1,7 @@
 //! 统一后端：同一套调用在"本地进程读镜像"和"特权 helper 读设备"之间无感切换。
 
 use crate::client::Client;
-use crate::model::{EntryDto, PreviewDto, SourceDto};
+use crate::model::{EntryDto, NxsbReportDto, PreviewDto, SourceDto};
 use crate::session::{OpenError, Session};
 use std::io::Write;
 
@@ -75,6 +75,47 @@ impl Backend {
         match self {
             Backend::Local(s) => s.read_path(path, out),
             Backend::Remote(c) => c.read_path(path, out),
+        }
+    }
+
+    /// 列出容器里所有可用的 NXSB 副本（容器头修复前的清单）。
+    pub fn scan_nxsb(
+        &mut self,
+        source: &str,
+        container_offset: u64,
+        block_size: u32,
+    ) -> Result<NxsbReportDto, String> {
+        match self {
+            // 本地模式（镜像文件 / 已有权限的设备）直接扫
+            Backend::Local(_) => crate::repair::scan_nxsb(source, container_offset, block_size),
+            Backend::Remote(c) => c.scan_nxsb(source, container_offset, block_size),
+        }
+    }
+
+    /// 修复 APFS 容器头：把选中的 NXSB 副本写回块 0。
+    ///
+    /// 这是全项目唯一会写设备的地方，参数已经尽量收窄（只给源块号，
+    /// 写什么由内核层校验后自己决定）。
+    pub fn repair_nxsb(
+        &mut self,
+        source: &str,
+        container_offset: u64,
+        block_size: u32,
+        src_paddr: u64,
+        backup_path: &str,
+    ) -> Result<(u64, u64, String), String> {
+        match self {
+            Backend::Local(_) => crate::repair::repair_nxsb(
+                source,
+                container_offset,
+                block_size,
+                src_paddr,
+                backup_path,
+            )
+            .map(|o| (o.bytes, o.xid, o.backup_path)),
+            Backend::Remote(c) => {
+                c.repair_nxsb(source, container_offset, block_size, src_paddr, backup_path)
+            }
         }
     }
 }

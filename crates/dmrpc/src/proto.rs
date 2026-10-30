@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, Read, Write};
 
-use crate::model::{DiskDto, EntryDto, PreviewDto, SourceDto};
+use crate::model::{DiskDto, EntryDto, NxsbReportDto, PreviewDto, SourceDto};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -24,6 +24,24 @@ pub enum Request {
     /// 按 id 读（已删除项没有可用路径）
     ReadId { id: u64 },
     ReadPath { path: String },
+    /// 扫容器开头的块，列出所有可用的 NXSB 副本（修复前先给用户看清单）
+    ScanNxsb {
+        source: String,
+        container_offset: u64,
+        block_size: u32,
+    },
+    /// 修复 APFS 容器头：把 `src_paddr` 那块 NXSB 副本写回容器块 0。
+    ///
+    /// 全协议里**唯一的写操作**，所以参数给得很死：只能指定"设备 + 容器偏移 +
+    /// 源块号"，写多长、写什么、写哪儿全由 helper 自己决定，客户端无法越界。
+    /// 写之前会把原块 0 备份到 `backup_path`。
+    RepairNxsb {
+        source: String,
+        container_offset: u64,
+        block_size: u32,
+        src_paddr: u64,
+        backup_path: String,
+    },
     Shutdown,
 }
 
@@ -42,6 +60,14 @@ pub enum Reply {
     Chunk { len: u64 },
     /// 流结束
     End { total: u64 },
+    /// 容器头修复完成
+    Repaired {
+        bytes: u64,
+        xid: u64,
+        backup_path: String,
+    },
+    /// 可用的 NXSB 副本清单
+    NxsbList { report: NxsbReportDto },
 }
 
 pub fn write_request(w: &mut dyn Write, req: &Request) -> std::io::Result<()> {
