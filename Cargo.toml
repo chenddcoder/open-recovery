@@ -9,8 +9,8 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 rust-version = "1.70"
-repository = "https://github.com/chenddcoder/dmde-rs"
-description = "Open-source disk editor and data recovery toolkit (DMDE-alike)"
+repository = "https://github.com/chenddcoder/open-recovery"
+description = "Open-source read-only disk, partition and file-system recovery toolkit"
 
 [workspace.dependencies]
 dmdisk = { path = "crates/dmdisk" }

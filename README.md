@@ -1,10 +1,15 @@
-# dmde-rs
+# open-recovery
 
-DMDE（DM Disk Editor and Data Recovery）的**开源替代实现**：磁盘/分区解析 + 多文件系统只读浏览 + 删除文件恢复。
+开源、**只读优先**的磁盘与数据恢复工具：磁盘/分区解析 + 多文件系统浏览 + 删除文件恢复 + APFS 容器头修复。
 Rust 核心**零第三方依赖**，命令行与图形界面共用同一套引擎。
 
-> 设计前提：恢复工具的第一原则是**不要动现场**。本项目所有打开路径都是只读，
-> 任何写操作只能发生在你指定的输出目录里。
+> 设计前提：恢复工具的第一原则是**不要动现场**。除了一处必须显式确认的 4 KiB 容器头修复
+> （见[「唯一的写操作」](#唯一的写操作apfs-容器头修复)），所有打开路径都是只读，
+> 其余写入只能发生在你指定的输出目录里。
+>
+> 命名说明：仓库已改名为 `open-recovery`，但构建产物目前仍沿用旧名——可执行文件 `dmde-rs`、
+> 提权 helper `dmde-rs-helper`、App `dmde-rs.app`。改名会断开已装好的 App 与 helper 的协议约定，
+> 所以留到下一个版本一起做；下文的命令与路径以现有产物为准。
 
 ---
 
@@ -15,7 +20,7 @@ Rust 核心**零第三方依赖**，命令行与图形界面共用同一套引�
 | 物理盘/分区枚举 | ✅ macOS、Linux | Windows 预留（`CreateFileW` + `DeviceIoControl`） |
 | 镜像文件读取 | ✅ | `.img/.dd/.raw`，`.dmg` 需先 `hdiutil convert -format UDRW` |
 | 只读块设备访问 | ✅ | macOS 走 `/dev/rdisk*` + `F_NOCACHE`，4K 扇区自适应 |
-| 扇区级读写 | ⏳ 规划 | 本版只读，不提供写盘 |
+| 扇区级读写 | 🚧 仅一处 | 通用扇区编辑未实现；唯一例外是 APFS 容器头修复（写 4 KiB，见下） |
 | 分区表 MBR / EBR | ✅ | 含扩展分区链、环检测 |
 | 分区表 GPT | ✅ | 头/分区项 CRC32 校验、备份表提示、4K 扇区识别 |
 | 分区表 APM | ✅ | 老 Mac / 部分装机 U 盘 |
@@ -26,8 +31,9 @@ Rust 核心**零第三方依赖**，命令行与图形界面共用同一套引�
 | HFS+ / HFSX | ✅ 已验证 | 卷头、catalog B-tree、fork extents |
 | APFS | ✅ 已验证 | 容器/检查点/对象映射/fs-tree；多卷（`--volume`）、两种 drec 键格式 |
 | APFS 删除恢复 | 🚧 部分 | `.Trashes` + 孤儿 inode；快照 diff 与雕刻待做 |
+| APFS 容器头修复 | ✅ 已验证 | 扫描检查点副本 → 二次确认 → 写回块 0，写前自动备份 |
 | 签名雕刻（carving） | ⏳ 规划 | HFS+/APFS 深删后只能靠它 |
-| GUI | ✅ Tauri v2 | 磁盘→分区→目录→预览→导出/恢复 |
+| GUI | ✅ Tauri v2 | 磁盘→分区→目录→预览→导出/恢复→容器头修复 |
 | 提权读取设备 | ✅ macOS | 系统授权窗 → 只读 helper，GUI 本体不以 root 运行 |
 
 "已验证"= 用真实镜像或字节级构造的镜像做过端到端断言（见「测试」一节）。
@@ -42,16 +48,17 @@ macOS 上打开 `/dev/rdisk*` 必须是 root。把整个 App（含 WebView）以
 这里的取舍是**只把"读"交出去**：
 
 ```
-GUI (你的身份)  ── Unix socket + token ──▶  dmde-rs-helper (root, 只读)
+GUI (你的身份)  ── Unix socket + token ──▶  dmde-rs-helper (root, 只读 + 一处 4 KiB 修复)
    │                                              │
-   └── 写恢复文件（你的身份、你的目录）            └── 列目录 / 预览 / 吐字节
+   └── 写恢复文件（你的身份、你的目录）            └── 列目录 / 预览 / 吐字节 / 修容器头
 ```
 
 * 点 `/dev/rdisk*` 时如果权限不足，自动弹 **macOS 标准授权窗**（`do shell script ... with administrator privileges`）；
   取消就报"已取消管理员授权"，不做任何事；
 * helper 的 socket 由 helper `chown` 回当前用户、权限 `0600`，放在 `~/Library/Application Support/dmde-rs/`，
   其它本地用户连不上；连接必须先 `hello` 带一次性随机 token；
-* helper **没有任何写接口**——恢复出来的文件由 GUI 以你的身份写盘，属主/TCC/权限都正确；
+* helper 只保留**一个**写接口：APFS 容器头修复（固定 4 KiB、必须二次确认、写前自动备份、目标必须是 `/dev/rdisk*`）。
+  恢复出来的文件仍由 GUI 以你的身份写盘，属主/TCC/权限都正确；
 * helper 空闲 900 秒自动退出并删除 socket；点"管理员权限"按钮也可手动请求，`drop_admin` 立即放弃；
 * helper 日志在 `~/Library/Application Support/dmde-rs/helper.log`。
 
@@ -114,9 +121,6 @@ GUI (你的身份)  ── Unix socket + token ──▶  dmde-rs-helper (root, 
 - **decmpfs 透明压缩文件**：读会明确报错并提示用 `ditto` / `afsctool -d` 解压，不会吐出压缩流冒充原文件。
 - **sealed 系统卷**：只读访问没问题，但不校验哈希树。
 - **快照**：只显示数量，尚未按快照读旧树。
-
-
----
 
 ---
 
@@ -193,6 +197,34 @@ sudo python3 scripts/probe-disk.py /dev/rdisk4
 
 GUI 里更简单：点这块盘 → 自动跳过 EFI、选中 APFS 分区和 `- Data` 卷 → 浏览目录 →
 「导出当前目录（含子目录）」。全程只读，不需要修分区表，也不写原盘。
+
+---
+
+## 唯一的写操作：APFS 容器头修复
+
+上面这块盘后来发现还有更省事的路：坏掉的其实只有容器**块 0 那 4 KiB**，
+检查点区里 140 份 NXSB 副本全部校验通过——把最新那份写回块 0，
+系统立刻重新识别出 `/dev/disk7`，6 个卷全部可挂载，实测读速 253 MB/s。
+于是不用再逐文件导出，直接在挂载点拷。
+
+GUI 里：左侧「当前卷」→ **「修复容器头…」** → 弹层自动扫描 → 选一份 → 点「写回块 0」。
+
+1. 扫容器开头 1024 块，收 `magic = NXSB` 且 Fletcher64 通过的副本，按 xid 降序去重；
+2. 列出候选（块号 / xid / 卷数），默认选最新的一份；
+3. 第一次点只是**上膛**（按钮变成「确认写回？再点一次」，不写盘），第二次才真正写；
+4. 写前把原块 0 备份到 `~/Library/Application Support/dmde-rs/block0-backup-<时间戳>.bin`；
+5. 写完回读比对，不一致会明确告诉你怎么用备份回滚。
+
+为什么整块复制而不是"抄字段"：NXSB 的校验和覆盖整块，且没有任何字段依赖"自己待在第几块"，
+原样搬过去校验自然成立。拒绝两类输入——源块是块 0 自己、源块不是校验通过的 NXSB；
+helper 端还强制目标必须是 `/dev/rdisk*`。
+
+> 适用判断：**系统还能挂载就别修，直接在挂载点拷**（更快也更安全）。
+> 只有系统完全不认盘、连分区都不列时，才值得动这 4 KiB。
+
+> 为什么会坏：块 0 是 APFS 每提交一次 checkpoint 就重写的位置，全盘写入最频繁的 LBA 之一，
+> 掉电/掉线时命中概率最高。这类损坏的典型特征是「该 LBA 读出均匀随机字节」——
+> 不是 EIO、也不是半截结构。特征是本文这块盘实测出来的。
 
 ---
 
@@ -290,16 +322,37 @@ $ ./dmde-rs tree backup.dmg / --depth 3
 
 ### 图形界面
 
-左侧选磁盘 → 选分区 → 中间浏览（可勾选「显示已删除」）→ 右侧预览（文本/十六进制自动切换）
-→ 单个「保存」或「导出当前目录（含子目录）」到输出目录。
+左侧选磁盘 → 选分区 → 中间浏览（可勾选「显示已删除」）→ 右侧预览（文本/十六进制自动切换）。
+
+导出就是"挑着恢复"，三种粒度：
+
+| 操作 | 结果 |
+|---|---|
+| 点某行末尾的「导出」 | 文件 → 只导这一个（按会话 id 读，已删除条目也能导）；目录 → 导整棵子树 |
+| 选中若干项 → 右侧主按钮 | 「导出选中的 N 项」，一次导出、共用一份进度 |
+| 什么都不选 → 右侧主按钮 | 「导出当前目录（含子目录）」 |
+
+选择用 `⌘` 点击加选/取消、`Shift` 点击选一段、`⌘A` 全选、`Esc` 清空；文件和目录可以混选
+（典型场景：只捞 Parallels 里那两三台虚拟机，而不是整个 Parallels 目录）。
+
+**跳过规则**（右侧输入框，逗号分隔，支持 `*` `?`）用来省掉"删了也能重新生成"的东西：
+默认含 `node_modules`、`bower_components`、`.git/.svn/.hg`、`__pycache__`、`.venv`、`.next`、
+`.cache`、`.gradle`、`DerivedData`、`.Trashes`、`.DS_Store` 等。命中的目录**整棵不读盘**、
+输出里也不会出现，汇总里写明「按规则跳过 N 个」。把输入框**清空** = 一条都不跳、全部恢复。
+手动点单个文件导出时不套规则——你已经明确点了它，哪怕叫 `x.log` 也照导。
 
 **同名文件**下拉框决定目标已存在时怎么办：
 
 | 策略 | 行为 | 适用 |
 |---|---|---|
-| 跳过（默认） | 已存在就不读不写，只计数 | 断点续导、重复导出同一目录 |
+| 跳过（默认） | 已存在**且大小一致**才跳过，不读不写 | 断点续导、重复导出同一目录 |
 | 保留两份 | 新文件改名 `名字 (1).扩展名` | 怕覆盖，想都留着对比 |
 | 覆盖 | 直接替换 | 确认上次导坏、要重来 |
+
+「跳过」不是只看"文件存在吗"，还比对大小：源非空而目标是 0 字节时判为空壳、照写不误。
+缺了这条判断，上次失败留下的空文件会被一直当成"已导出"，重导多少次都补不上
+（Parallels `.hdd` 里那个几十 GB 的 `.hds` 就是这么变成 0 字节的）。
+非空但大小不同则不动——那可能是你自己放的同名文件，要强制补齐请换「覆盖」。
 
 批量恢复（「恢复已删除」）固定用「保留两份」，不会覆盖你在输出目录里的旧结果。
 
@@ -316,9 +369,10 @@ $ ./dmde-rs tree backup.dmg / --depth 3
 ## 架构
 
 ```
-crates/dmdisk     只读块设备 + 分区表
+crates/dmdisk     只读块设备 + 分区表（外加一处受限写入）
 ├─ device.rs      BlockDevice trait、ImageFile、RawDevice（含 macOS F_NOCACHE / 4K 扇区探测）
 ├─ reader.rs      64 KiB 页缓存，子读取器共享同一份缓存（整盘扫描 + 卷解析不互相冷启）
+├─ write.rs       极小区间写（≤ 1 MiB、显式路径、fsync）；刻意不挂 BlockDevice trait
 ├─ scheme/        mbr.rs / gpt.rs / apm.rs + 自动识别顺序 GPT → APM → MBR
 └─ plist.rs       极简 XML plist 解析（枚举 macOS 磁盘用，避免引 IOKit）
 
@@ -328,8 +382,11 @@ crates/dmfs       文件系统解析 + 恢复
 ├─ ntfs/          boot / fixup / attr / record / runlist / index / fs
 ├─ ext/           superblock / inode / extent(树+间接块) / dir / fs
 ├─ hfsplus/       volume / catalog(B-tree 线性扫描) / fs
+├─ apfs/          container(NXSB+检查点) / omap / btree / volume / record / fs / repair(容器头修复)
 └─ detect.rs      签名探测 + AnyFs 门面
 
+crates/dmrpc      行式 JSON 协议 + 会话 + Local/Remote 双后端（GUI 与 helper 之间）
+crates/dmhelper   root 只读特权 helper（Unix socket + token + 空闲自退）
 crates/dmcli      命令行
 gui/              Tauri v2（Rust 后端直调 dmdisk/dmfs，前端纯 HTML/JS）
 
@@ -376,10 +433,17 @@ gui/              Tauri v2（Rust 后端直调 dmdisk/dmfs，前端纯 HTML/JS�
 
 ## 安全模型
 
-- 设备只读打开（`OpenOptions::new().read(true)`），代码里没有写设备的分支；
-- 所有写入都经过 `-o` 指定的输出目录，文件名经 `sanitize_name()` 去掉路径分隔符，避免目录穿越；
-- 同名文件自动追加 `.1/.2` 后缀，绝不覆盖既有文件；
-- 只读打开失败（macOS 权限）会明确提示用 `sudo`，而不是静默降级。
+- 设备一律只读打开（`OpenOptions::new().read(true)`）；能写设备的代码只有
+  `crates/dmdisk/src/write.rs` 一个文件，且**刻意不挂在 `BlockDevice` trait 上**——
+  解析路径在类型层面就拿不到写能力；
+- 那唯一一处写的硬约束：单次 ≤ 1 MiB、必须显式路径、写完 `fsync`、目标必须是 `/dev/rdisk*`、
+  写前备份原内容、写后回读比对（回读绕过 64 KiB 页缓存，验的是盘不是内存）；
+- 所有恢复/导出写入都经过 `-o` 或界面指定的输出目录，文件名经 `sanitize_name()`
+  去掉路径分隔符，避免目录穿越；
+- 同名文件默认跳过、绝不静默覆盖；「保留两份」追加 `名字 (1).扩展名`；
+- 「跳过已存在」还要比对大小：源非空而目标 0 字节判为空壳、照写不误，
+  否则上次失败留下的空文件会让重导永远跳过；
+- 只读打开失败（macOS 权限）会明确提示提权，而不是静默降级。
 
 ---
 
@@ -421,13 +485,14 @@ NTFS 没有可用的 mkntfs，APFS 更没法用 `hdiutil` 造出「多卷 + 大�
 
 ## 已知限制
 
-1. **只读**：没有扇区编辑/写回，也不打算在 v0.1 提供（写盘要配套"写前二次确认 + 备份"）。
+1. **只读优先**：没有通用扇区编辑/写回，也不打算在 v0.1 提供。
+   唯一的例外是 APFS 容器头修复（4 KiB、二次确认、写前自动备份）。
 2. **APFS 恢复能力有限**：能完整浏览/导出存活文件，但清空废纸篓后的文件只能靠快照；
    加密卷、decmpfs 压缩文件不支持。
 3. **RAID / LVM / LDM** 未实现，动态盘、软 RAID 需要用镜像重组。
 4. ext4 的 `meta_bg`、超大卷的块组定位可能不准；NTFS 的 `$ATTRIBUTE_LIST` 未展开。
 5. HFS+ 的 extents overflow 文件未解析，单文件超过 8 个 extent 时会提示"extents 溢出"。
-6. 无进度条细粒度回调（大卷扫描时只有开始/结束提示）。
+6. 只能修 APFS 容器头；文件系统内部结构（omap、fs-tree）损坏没有自动修复。
 
 ## Roadmap
 
@@ -436,20 +501,22 @@ NTFS 没有可用的 mkntfs，APFS 更没法用 `hdiutil` 造出「多卷 + 大�
 - [ ] 镜像/克隆（坏道跳过与重试、速度曲线）
 - [ ] GPT 备份表恢复、丢失分区扫描重建
 - [x] APFS 容器、多卷、fs-tree 浏览与导出
+- [x] APFS 容器头修复（扫检查点副本 + 二次确认写回）
 - [ ] APFS 快照列表与按旧 xid 恢复删除文件
 - [ ] APFS 加密卷（keybag + AES-XTS）
 - [ ] Windows 后端（`PhysicalDrive`）
 - [ ] 分区表/GPT 导出与写回（带二次确认）
+- [ ] 构建产物统一改名为 `open-recovery`（可执行文件 / helper / App）
 
 ## 与 DMDE 的差异
 
-| | dmde-rs | DMDE |
+| | open-recovery | DMDE |
 |---|---|---|
 | 授权 | MIT | 免费版有限制，专业版收费 |
 | 平台 | macOS / Linux（Windows 规划） | Windows / macOS / Linux / DOS |
-| 扇区编辑 | 未实现 | 完整 |
+| 扇区编辑 | 未实现（仅容器头修复） | 完整 |
 | 文件系统覆盖 | FAT/exFAT/NTFS/ext/HFS+ | 更多（ReFS、UFS、Btrfs、XFS…） |
-| APFS | 浏览/导出（不含快照恢复） | 支持 |
+| APFS | 浏览/导出 + 容器头修复（不含快照恢复） | 支持 |
 | RAID 重建 | 未实现 | 支持 |
 | 代码可审计 | 是（零依赖核心） | 闭源 |
 
